@@ -81,10 +81,6 @@ async fn main() {
     let cors = CorsLayer::new()
         // 只允许特定域名
         .allow_origin(Any)
-        // 或使用 AllowOrigin::exact
-        .allow_origin(AllowOrigin::exact(HeaderValue::from_static(
-            "https://your-domain.com",
-        )))
         // 允许的方法
         .allow_methods([
             Method::GET,
