@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# 运行时产生的数据目录
+/uploads/
+/video/
+
+# 配置（含敏感字段时按需注释掉这行）
+/.conf.toml
+
+# 前端
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
