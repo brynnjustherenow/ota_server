@@ -1,9 +1,9 @@
-use std::fs;
+use std::{fs, time::Duration};
 
 use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
-    http::{StatusCode, uri::Port},
+    http::{HeaderValue, Method, StatusCode, header, uri::Port},
     routing::{get, post},
 };
 mod hardware;
@@ -12,6 +12,7 @@ mod service;
 use mqtt5::{ConnectOptions, MqttClient};
 use serde::{Deserialize, Serialize};
 use toasty::schema::app;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{info, warn};
 use tracing_subscriber::fmt::format;
 
@@ -77,7 +78,30 @@ async fn main() {
         config: conf,
     };
     let _ = app_state.send_version("1.0.1".to_string()).await;
-
+    let cors = CorsLayer::new()
+        // 只允许特定域名
+        .allow_origin([
+            "http://localhost:5173".parse::<HeaderValue>().unwrap(),
+            "https://your-domain.com".parse::<HeaderValue>().unwrap(),
+        ])
+        // 或使用 AllowOrigin::exact
+        .allow_origin(AllowOrigin::exact(HeaderValue::from_static(
+            "https://your-domain.com",
+        )))
+        // 允许的方法
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+        ])
+        // 允许的请求头
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+        // 暴露的响应头
+        .expose_headers([header::CONTENT_TYPE])
+        // 预检请求缓存时间
+        .max_age(Duration::from_secs(3600));
     let app = Router::new()
         .route("/health", get(health))
         // OTA：列出所有版本 / 拉清单 / 下载
@@ -95,10 +119,7 @@ async fn main() {
         .route("/ota/{version}/publish", post(service::ota::ota_publish))
         .route("/ota/{version}/notify", post(service::ota::ota_update))
         // 设备端：上传/列出/下载视频（关闭默认 2MB body 限制）
-        .route(
-            "/video",
-            get(service::video::list_devices),
-        )
+        .route("/video", get(service::video::list_devices))
         .route(
             "/video/{device_id}",
             get(service::video::list_videos)
@@ -109,7 +130,8 @@ async fn main() {
             "/video/{device_id}/{filename}",
             get(service::video::download_video),
         )
-        .with_state(app_state);
+        .with_state(app_state)
+        .layer(cors);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();

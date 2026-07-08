@@ -1,5 +1,6 @@
 // 所有接口封装。BASE 走 Vite 代理（见 vite.config.js）。
-const BASE = "/api";
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+const BASE = API_BASE_URL;
 
 /**
  * 简单版本号比较（按点分段整数比较，非严格 SemVer）
@@ -52,7 +53,7 @@ export async function uploadVideo(deviceId, file, filename, onProgress) {
     xhr.open("POST", `${BASE}/video/${encodeURIComponent(deviceId)}`);
     xhr.setRequestHeader(
       "Content-Disposition",
-      `attachment; filename="${filename || file.name}"`
+      `attachment; filename="${filename || file.name}"`,
     );
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
@@ -96,7 +97,7 @@ export async function listVideos(deviceId) {
  */
 export async function downloadVideo(deviceId, filename) {
   const resp = await fetch(
-    `${BASE}/video/${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`
+    `${BASE}/video/${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`,
   );
   if (!resp.ok) return { ok: false, status: resp.status };
   const blob = await resp.blob();
@@ -135,7 +136,8 @@ export async function publishOta(version, items, onProgress) {
       } catch {
         data = xhr.responseText;
       }
-      if (xhr.status >= 200 && xhr.status < 300) resolve({ ok: true, status: xhr.status, data });
+      if (xhr.status >= 200 && xhr.status < 300)
+        resolve({ ok: true, status: xhr.status, data });
       else resolve({ ok: false, status: xhr.status, data });
     };
     xhr.onerror = () => reject(new Error("网络错误"));
@@ -156,7 +158,7 @@ export async function listVersions() {
  */
 export async function getManifest(version) {
   const resp = await fetch(
-    `${BASE}/ota/${encodeURIComponent(version)}/manifest`
+    `${BASE}/ota/${encodeURIComponent(version)}/manifest`,
   );
   return parseBody(resp);
 }
@@ -173,16 +175,28 @@ export async function downloadOtaFile(version, relPath, etag = null) {
       .split("/")
       .map(encodeURIComponent)
       .join("/")}`,
-    { headers: headersFromObj({ "If-None-Match": etag }) }
+    { headers: headersFromObj({ "If-None-Match": etag }) },
   );
   if (resp.status === 304) {
-    return { ok: true, status: 304, notModified: true, etag: resp.headers.get("etag") };
+    return {
+      ok: true,
+      status: 304,
+      notModified: true,
+      etag: resp.headers.get("etag"),
+    };
   }
   if (!resp.ok) return parseBody(resp);
   const blob = await resp.blob();
   const newEtag = resp.headers.get("etag");
   const blobUrl = URL.createObjectURL(blob);
-  return { ok: true, status: 200, notModified: false, etag: newEtag, blobUrl, size: blob.size };
+  return {
+    ok: true,
+    status: 200,
+    notModified: false,
+    etag: newEtag,
+    blobUrl,
+    size: blob.size,
+  };
 }
 
 /**
@@ -191,7 +205,7 @@ export async function downloadOtaFile(version, relPath, etag = null) {
 export async function notifyOta(version) {
   const resp = await fetch(
     `${BASE}/ota/${encodeURIComponent(version)}/notify`,
-    { method: "POST" }
+    { method: "POST" },
   );
   return parseBody(resp);
 }
