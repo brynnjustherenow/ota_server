@@ -90,9 +90,9 @@ async fn main() {
             Method::PATCH,
         ])
         // 允许的请求头
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT])
+        .allow_headers(Any)
         // 暴露的响应头
-        .expose_headers([header::CONTENT_TYPE])
+        .expose_headers(Any)
         // 预检请求缓存时间
         .max_age(Duration::from_secs(3600));
     let app = Router::new()
