@@ -80,10 +80,7 @@ async fn main() {
     let _ = app_state.send_version("1.0.1".to_string()).await;
     let cors = CorsLayer::new()
         // 只允许特定域名
-        .allow_origin([
-            "http://localhost:5173".parse::<HeaderValue>().unwrap(),
-            "https://your-domain.com".parse::<HeaderValue>().unwrap(),
-        ])
+        .allow_origin(Any)
         // 或使用 AllowOrigin::exact
         .allow_origin(AllowOrigin::exact(HeaderValue::from_static(
             "https://your-domain.com",
