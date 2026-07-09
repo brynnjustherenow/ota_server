@@ -24,6 +24,8 @@ pub enum OtaError {
     InvalidInput(String),
     #[error("I/O 错误: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("DB 错误: {0}")]
+    DbError(#[from] sqlx::Error),
     #[error("没有权限")]
     UnAuthed,
 }
@@ -33,7 +35,8 @@ impl OtaError {
             Self::MQTTERROR(_)
             | Self::UNDEFINEDOPTIONS(_)
             | Self::InvalidInput(_)
-            | Self::IoError(_) => 500,
+            | Self::IoError(_)
+            | Self::DbError(_) => 500,
             Self::FileNotFound(_) => 404,
             Self::UnAuthed => 400,
         }

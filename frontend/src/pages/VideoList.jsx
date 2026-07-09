@@ -19,7 +19,7 @@ import {
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { listVideos, downloadVideo, listDevices } from "../api.js";
-
+import { API_BASE_URL } from "../api.js";
 const { Text } = Typography;
 
 function fmtSize(n) {
@@ -97,7 +97,7 @@ export default function VideoListPage() {
 
   const play = (filename) => {
     // 用代理 URL，浏览器原生支持播放
-    const url = `/api/video/${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`;
+    const url = `${API_BASE_URL}/video/${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`;
     setPlaying({ filename, url });
   };
 
@@ -178,7 +178,9 @@ export default function VideoListPage() {
           options={devices}
           notFoundContent={
             devices.length === 0 ? (
-              <span style={{ color: "#999" }}>暂无设备，先上传一个视频试试</span>
+              <span style={{ color: "#999" }}>
+                暂无设备，先上传一个视频试试
+              </span>
             ) : null
           }
         />

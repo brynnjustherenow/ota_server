@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use axum::{
+    Json,
     extract::{Multipart, Path as AxumPath, State},
 };
 use futures_util::TryStreamExt;
 use md5::{Digest, Md5};
+use serde::Deserialize;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::StreamReader;
@@ -19,38 +21,129 @@ pub async fn ota_update(
     AxumPath(version): AxumPath<String>,
     State(app_state): State<AppState>,
 ) -> Result<Response<()>, OtaError> {
-    app_state.send_version(version).await?;
+    let decision = resolve_broadcast(&app_state.db, &version).await;
+    if decision.skip {
+        return Err(OtaError::InvalidInput(format!(
+            "版本 {version} 文件夹不存在/为空 且 无 config，跳过广播"
+        )));
+    }
+    app_state
+        .send_fleet_update(&version, decision.config.as_ref())
+        .await?;
     Ok(Response::success(()))
+}
+
+/// 版本文件夹是否存在且非空（至少一个条目）
+pub async fn version_folder_has_files(version: &str) -> bool {
+    let dir = Path::new("uploads").join(version);
+    let Ok(mut entries) = fs::read_dir(&dir).await else {
+        return false;
+    };
+    while let Ok(Some(_)) = entries.next_entry().await {
+        return true;
+    }
+    false
+}
+
+/// 广播决策：版本文件夹不存在/为空 且 无 config → skip=true（跳过，保留上一条 retained）。
+/// 否则 skip=false，config 为该版本 config（可能 None）。
+pub struct BroadcastDecision {
+    pub skip: bool,
+    pub config: Option<serde_json::Value>,
+}
+
+pub async fn resolve_broadcast(pool: &sqlx::SqlitePool, version: &str) -> BroadcastDecision {
+    let config = get_version_config_raw(pool, version).await;
+    let has_files = version_folder_has_files(version).await;
+    if !has_files && config.is_none() {
+        return BroadcastDecision { skip: true, config: None };
+    }
+    BroadcastDecision { skip: false, config }
 }
 
 /// GET /ota
 /// 列出所有已发布的版本号，按 SemVer 倒序（最新在前）
 pub async fn list_versions() -> Result<Response<Vec<String>>, OtaError> {
+    Ok(Response::success(sorted_versions().await))
+}
+
+/// 读取 uploads/ 下所有版本目录，按 SemVer 倒序返回（最新在前）
+async fn sorted_versions() -> Vec<String> {
     let root = Path::new("uploads");
-    if !fs::try_exists(root).await? {
-        return Ok(Response::success(vec![]));
-    }
-    let mut entries = fs::read_dir(root).await?;
+    let mut entries = match fs::read_dir(root).await {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
     let mut versions: Vec<String> = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let ft = entry.file_type().await?;
-        if ft.is_dir() {
-            // 跳过 staging 残留
-            if let Ok(name) = entry.file_name().into_string()
-                && !name.starts_with('.')
-            {
-                versions.push(name);
-            }
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(ft) = entry.file_type().await else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        if let Ok(name) = entry.file_name().into_string()
+            && !name.starts_with('.')
+        {
+            versions.push(name);
         }
     }
-    // 用 version-compare 倒序：b compare a，最新在前；无法解析的版本按字符串回退
     versions.sort_by(|a, b| {
         version_compare::compare(b, a)
             .ok()
             .and_then(|c| c.ord())
             .unwrap_or_else(|| b.cmp(a))
     });
-    Ok(Response::success(versions))
+    versions
+}
+
+pub async fn latest_published_version() -> Option<String> {
+    sorted_versions().await.into_iter().next()
+}
+
+#[derive(Deserialize)]
+pub struct ConfigReq {
+    config: serde_json::Value,
+}
+
+/// 取某版本的 config（供 interval/notify 下发）。无则 None。
+pub async fn get_version_config_raw(
+    pool: &sqlx::SqlitePool,
+    version: &str,
+) -> Option<serde_json::Value> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT config FROM version_config WHERE version = ?")
+        .bind(version)
+        .fetch_optional(pool)
+        .await
+        .ok()?;
+    row.and_then(|(s,)| serde_json::from_str(&s).ok())
+}
+
+/// POST /ota/{version}/config  body: {"config": {...}}
+pub async fn set_version_config(
+    State(app_state): State<AppState>,
+    AxumPath(version): AxumPath<String>,
+    Json(req): Json<ConfigReq>,
+) -> Result<Response<()>, OtaError> {
+    let config_json = serde_json::to_string(&req.config)
+        .map_err(|e| OtaError::InvalidInput(format!("序列化 config 失败: {e}")))?;
+    sqlx::query("INSERT OR REPLACE INTO version_config (version, config) VALUES (?, ?)")
+        .bind(&version)
+        .bind(&config_json)
+        .execute(&app_state.db)
+        .await?;
+    Ok(Response::success(()))
+}
+
+/// GET /ota/{version}/config
+pub async fn get_version_config(
+    State(app_state): State<AppState>,
+    AxumPath(version): AxumPath<String>,
+) -> Result<Response<serde_json::Value>, OtaError> {
+    match get_version_config_raw(&app_state.db, &version).await {
+        Some(v) => Ok(Response::success(v)),
+        None => Err(OtaError::FileNotFound(format!("版本 {version} 无配置"))),
+    }
 }
 
 /// 版本发布：先写入 staging 目录，全部成功后原子替换为 uploads/{version}/，

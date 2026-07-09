@@ -7,6 +7,7 @@ import {
   FileSearchOutlined,
   DownloadOutlined,
   NotificationOutlined,
+  SettingOutlined,
 } from "@ant-design/icons";
 
 import VideoUploadPage from "./pages/VideoUpload.jsx";
@@ -15,6 +16,7 @@ import OtaPublishPage from "./pages/OtaPublish.jsx";
 import OtaManifestPage from "./pages/OtaManifest.jsx";
 import OtaDownloadPage from "./pages/OtaDownload.jsx";
 import OtaNotifyPage from "./pages/OtaNotify.jsx";
+import OtaConfigPage from "./pages/OtaConfig.jsx";
 
 const { Sider, Content, Header } = Layout;
 
@@ -25,6 +27,7 @@ const items = [
   { key: "ota-publish", icon: <CloudUploadOutlined />, label: "OTA 发布" },
   { key: "ota-manifest", icon: <FileSearchOutlined />, label: "OTA Manifest" },
   { key: "ota-download", icon: <DownloadOutlined />, label: "OTA 文件下载（ETag 演示）" },
+  { key: "ota-config", icon: <SettingOutlined />, label: "OTA 配置下发" },
   { key: "ota-notify", icon: <NotificationOutlined />, label: "OTA 广播通知" },
 ];
 
@@ -74,6 +77,7 @@ export default function App() {
             {active === "ota-publish" && <OtaPublishPage />}
             {active === "ota-manifest" && <OtaManifestPage />}
             {active === "ota-download" && <OtaDownloadPage />}
+            {active === "ota-config" && <OtaConfigPage />}
             {active === "ota-notify" && <OtaNotifyPage />}
           </div>
         </Content>

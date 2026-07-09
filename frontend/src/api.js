@@ -209,3 +209,30 @@ export async function notifyOta(version) {
   );
   return parseBody(resp);
 }
+
+/**
+ * 读取某版本的 config（随 fleet_update 下发 merge 到设备 device_cfg.json）
+ */
+export async function getVersionConfig(version) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/config`,
+  );
+  return parseBody(resp);
+}
+
+/**
+ * 设置某版本的 config
+ * @param {string} version
+ * @param {object} configObj  会原样存入 sqlite，下发时 deep_merge 进设备配置
+ */
+export async function setVersionConfig(version, configObj) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/config`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: configObj }),
+    },
+  );
+  return parseBody(resp);
+}

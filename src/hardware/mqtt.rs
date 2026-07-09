@@ -1,10 +1,12 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use chrono::Local;
-use mqtt5::{Message, MqttClient, callback};
+use mqtt5::{Message, MqttClient, PublishOptions, callback};
 use postcard::{Error, to_vec};
 use serde::{Deserialize, Serialize};
+use tokio::time::interval;
+use tracing::{info, warn};
 
 use crate::{AppState, service::OtaError};
 impl AppState {
@@ -29,22 +31,34 @@ impl AppState {
         Ok(())
     }
     pub async fn send_version(&self, version: String) -> Result<(), OtaError> {
-        let topic = &self.config.mqtt_conf.cmd_topic;
-        let message = OtaMessage {
-            ts: Local::now().timestamp_millis() as u64,
-            version,
-        };
-        let payload = message
-            .try_into()
-            .map_err(|e| OtaError::InvalidInput("参数无法转换为payload".to_string()))?;
-        self.sent_command(topic, payload).await
+        self.send_fleet_update(&version, None).await
     }
 
-    pub async fn send_video_event(
+    /// 发布 retained 消息：同 topic 仅保留最后一条，故版本与配置合并为 fleet_update。
+    pub async fn publish_retained(&self, topic: &str, msg: Vec<u8>) -> Result<(), OtaError> {
+        let mut opts = PublishOptions::default();
+        opts.retain = true;
+        self.ota_client.publish_with_options(topic, msg, opts).await?;
+        Ok(())
+    }
+
+    /// 合并下发版本号 + 可选配置（设备收到后触发 OTA 比对 + config merge）。
+    pub async fn send_fleet_update(
         &self,
-        device_id: &str,
-        filename: &str,
+        version: &str,
+        config: Option<&serde_json::Value>,
     ) -> Result<(), OtaError> {
+        let topic = &self.config.mqtt_conf.cmd_topic;
+        let payload = match config {
+            Some(c) => serde_json::json!({ "cmd": "fleet_update", "version": version, "config": c }),
+            None => serde_json::json!({ "cmd": "fleet_update", "version": version }),
+        };
+        let payload = serde_json::to_vec(&payload)
+            .map_err(|e| OtaError::InvalidInput(format!("序列化 fleet_update 失败: {e}")))?;
+        self.publish_retained(topic, payload).await
+    }
+
+    pub async fn send_video_event(&self, device_id: &str, filename: &str) -> Result<(), OtaError> {
         let topic = &self.config.mqtt_conf.status_topic;
         let event = VideoEvent {
             event: "video_uploaded".to_string(),
@@ -135,4 +149,34 @@ pub fn split_rel_path(rel: &str) -> (String, String) {
         Some(idx) => (rel[..idx].to_string(), rel[idx + 1..].to_string()),
         None => (String::new(), rel.to_string()),
     }
+}
+/// 每 10 分钟检测最新已发布版本，合并其 config（sqlite）后以 retained 广播。
+/// 设备每次订阅 cmd topic 即收到最后一条 fleet_update，无需服务端精确把握设备在线时刻。
+pub fn interval_publish_service(app_state: &AppState) {
+    let app = app_state.clone();
+    tokio::spawn(async move {
+        // interval 首次 tick 立即触发，之后每 10 分钟一次
+        let mut interval = interval(Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            match crate::service::ota::latest_published_version().await {
+                Some(version) => {
+                    let decision =
+                        crate::service::ota::resolve_broadcast(&app.db, &version).await;
+                    if decision.skip {
+                        info!(
+                            "version {version} 文件夹为空且无 config，跳过广播（保留上一条 retained）"
+                        );
+                        continue;
+                    }
+                    if app.send_fleet_update(&version, decision.config.as_ref()).await.is_err() {
+                        warn!("fleet_update publish failed");
+                    } else {
+                        info!("fleet_update broadcast version={version}");
+                    }
+                }
+                None => info!("no published version yet, skip"),
+            }
+        }
+    });
 }

@@ -6,6 +6,8 @@ Cargo.lock
 # 运行时产生的数据目录
 /uploads/
 /video/
+/config.db
+/config.db-*
 
 # 配置（含敏感字段时按需注释掉这行）
 /.conf.toml

@@ -1,33 +1,34 @@
-use std::{fs, time::Duration};
+use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
     http::{HeaderValue, Method, StatusCode, header, uri::Port},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 mod hardware;
 mod service;
 
 use mqtt5::{ConnectOptions, MqttClient};
 use serde::{Deserialize, Serialize};
-use toasty::schema::app;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tokio::sync::Mutex;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
-use tracing_subscriber::fmt::format;
 
 #[derive(Clone)]
 pub struct AppState {
     ota_client: MqttClient,
-    db_pool: String,
+    db: sqlx::SqlitePool,
     config: Config,
+    uploads: Arc<Mutex<HashMap<String, service::video::UploadSession>>>,
 }
 impl AppState {
-    fn new(client: MqttClient, pool: String, config: Config) -> Self {
+    fn new(client: MqttClient, db: sqlx::SqlitePool, config: Config) -> Self {
         Self {
             ota_client: client,
-            db_pool: pool,
+            db,
             config: config,
+            uploads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -72,12 +73,29 @@ async fn main() {
         .expect("create mqtt client failed");
 
     let port = conf.port;
+    // SQLite：存储每个版本对应的 config（随 fleet_update 下发 merge）
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename("config.db")
+                .create_if_missing(true),
+        )
+        .await
+        .expect("sqlite pool init");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS version_config (version TEXT PRIMARY KEY, config TEXT NOT NULL)",
+    )
+    .execute(&db)
+    .await
+    .expect("version_config migrate");
     let app_state = AppState {
         ota_client: client,
-        db_pool: "".to_string(),
+        db,
         config: conf,
+        uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-    let _ = app_state.send_version("1.0.1".to_string()).await;
+    // 每 10 分钟广播最新版本（retained），设备订阅即收
+    hardware::mqtt::interval_publish_service(&app_state);
     let cors = CorsLayer::new()
         // 只允许特定域名
         .allow_origin(Any)
@@ -111,6 +129,11 @@ async fn main() {
         // 管理端：发布新版本（上传）/ 通知设备升级（MQTT 广播）
         .route("/ota/{version}/publish", post(service::ota::ota_publish))
         .route("/ota/{version}/notify", post(service::ota::ota_update))
+        // 管理端：按版本读写 config（sqlite，随 fleet_update 下发 merge）
+        .route(
+            "/ota/{version}/config",
+            get(service::ota::get_version_config).post(service::ota::set_version_config),
+        )
         // 设备端：上传/列出/下载视频（关闭默认 2MB body 限制）
         .route("/video", get(service::video::list_devices))
         .route(
@@ -123,6 +146,13 @@ async fn main() {
             "/video/{device_id}/{filename}",
             get(service::video::download_video),
         )
+        // 设备端：三段式分片上传（init / chunk / complete）
+        .route("/upload/init", post(service::video::upload_init))
+        .route(
+            "/upload/chunk",
+            put(service::video::upload_chunk).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/upload/complete", post(service::video::upload_complete))
         .with_state(app_state)
         .layer(cors);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
@@ -131,8 +161,8 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health() -> (StatusCode, &'static str) {
-    (StatusCode::OK, "Hello, World!")
+async fn health() -> (StatusCode) {
+    (StatusCode::OK)
 }
 /// init the mqtt client and subscribe the topics
 async fn init_mqtt_client(config: &MqttConfig) -> Result<MqttClient, String> {

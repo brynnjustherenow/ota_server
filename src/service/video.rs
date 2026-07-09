@@ -1,10 +1,12 @@
 use std::{
     cmp::Reverse,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path as AxumPath, State},
     http::HeaderMap,
@@ -13,7 +15,7 @@ use axum::{
 use chrono::Local;
 use futures_util::TryStreamExt;
 use md5::{Digest, Md5};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -229,4 +231,222 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ===================== 三段式分片上传（init / chunk / complete）=====================
+// 设备端 upload_client.py 期望扁平 JSON 响应（{upload_id, offset} 顶层），
+// 故这三个端点直返 Json<T>，不套 Response<T>；错误仍走 OtaError（{code,message,data:null}）。
+
+static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn gen_upload_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let c = UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("up_{ts}_{c}")
+}
+
+pub struct UploadSession {
+    device_id: String,
+    filename: String,
+    file_size: u64,
+    temp_path: PathBuf,
+    received: u64,
+}
+
+#[derive(Deserialize)]
+pub struct UploadInitReq {
+    pub device_id: String,
+    pub filename: String,
+    pub file_size: u64,
+    pub upload_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UploadInitResp {
+    pub upload_id: String,
+    pub offset: u64,
+}
+
+#[derive(Serialize)]
+pub struct UploadChunkResp {
+    pub offset: u64,
+}
+
+#[derive(Deserialize)]
+pub struct UploadCompleteReq {
+    pub upload_id: String,
+}
+
+#[derive(Serialize)]
+pub struct UploadCompleteResp {
+    pub ok: bool,
+    pub md5: Option<String>,
+}
+
+/// POST /upload/init
+/// 新建或续传上传会话。返回 upload_id 与起始 offset（0 表新传，>0 表续传）。
+/// 响应扁平：{"upload_id": "...", "offset": N}
+pub async fn upload_init(
+    State(app_state): State<AppState>,
+    Json(req): Json<UploadInitReq>,
+) -> Result<Json<UploadInitResp>, OtaError> {
+    if !is_safe_name(&req.device_id) {
+        return Err(OtaError::InvalidInput(format!("非法 device_id: {}", req.device_id)));
+    }
+    if !is_safe_name(&req.filename) {
+        return Err(OtaError::InvalidInput(format!("非法 filename: {}", req.filename)));
+    }
+
+    let dir = Path::new("video").join(&req.device_id);
+    fs::create_dir_all(&dir).await?;
+
+    let mut uploads = app_state.uploads.lock().await;
+
+    // 续传：客户端带上已存在的 upload_id
+    if let Some(uid) = req.upload_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(sess) = uploads.get(uid) {
+            return Ok(Json(UploadInitResp {
+                upload_id: uid.to_string(),
+                offset: sess.received,
+            }));
+        }
+    }
+
+    let upload_id = gen_upload_id();
+    let temp_path = dir.join(format!(".{upload_id}.partial"));
+    fs::File::create(&temp_path).await?; // 创建空文件，覆盖可能残留
+    uploads.insert(
+        upload_id.clone(),
+        UploadSession {
+            device_id: req.device_id,
+            filename: req.filename,
+            file_size: req.file_size,
+            temp_path,
+            received: 0,
+        },
+    );
+    Ok(Json(UploadInitResp {
+        upload_id,
+        offset: 0,
+    }))
+}
+
+/// PUT /upload/chunk
+/// 追加写入分片。X-Offset 必须等于服务端已收字节数，否则拒绝。
+/// 响应扁平：{"offset": N}
+pub async fn upload_chunk(
+    State(app_state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<UploadChunkResp>, OtaError> {
+    let upload_id = headers
+        .get("x-upload-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| OtaError::InvalidInput("缺少 X-Upload-Id".to_string()))?
+        .to_string();
+    let x_offset = headers
+        .get("x-offset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| OtaError::InvalidInput("缺少/非法 X-Offset".to_string()))?;
+
+    let mut uploads = app_state.uploads.lock().await;
+    let sess = uploads
+        .get_mut(&upload_id)
+        .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {upload_id}")))?;
+
+    if x_offset != sess.received {
+        return Err(OtaError::InvalidInput(format!(
+            "offset 不匹配: 客户端={x_offset} 服务端={}",
+            sess.received
+        )));
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(&sess.temp_path)
+        .await?;
+    let mut reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).await?;
+        sess.received += n as u64;
+    }
+    file.flush().await?;
+
+    Ok(Json(UploadChunkResp {
+        offset: sess.received,
+    }))
+}
+
+/// POST /upload/complete
+/// 完成上传：校验大小、计算 MD5、原子 rename、广播 MQTT 事件。
+/// 响应扁平：{"ok": true, "md5": "..."}
+pub async fn upload_complete(
+    State(app_state): State<AppState>,
+    Json(req): Json<UploadCompleteReq>,
+) -> Result<Json<UploadCompleteResp>, OtaError> {
+    let sess = {
+        let mut uploads = app_state.uploads.lock().await;
+        uploads
+            .remove(&req.upload_id)
+            .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {}", req.upload_id)))?
+    };
+
+    let dir = Path::new("video").join(&sess.device_id);
+    let final_path = dir.join(&sess.filename);
+
+    let result: Result<String, OtaError> = async {
+        if sess.received != sess.file_size {
+            return Err(OtaError::InvalidInput(format!(
+                "大小不符: 已收={} 声明={}",
+                sess.received, sess.file_size
+            )));
+        }
+        // 计算 MD5（读一遍 partial）
+        let mut f = fs::File::open(&sess.temp_path).await?;
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let md5_hex = format!("{:x}", hasher.finalize());
+
+        // 原子提交：删旧 → rename
+        if fs::try_exists(&final_path).await? {
+            fs::remove_file(&final_path).await?;
+        }
+        fs::rename(&sess.temp_path, &final_path).await?;
+        Ok(md5_hex)
+    }
+    .await;
+
+    match result {
+        Ok(md5_hex) => {
+            if let Err(e) = app_state.send_video_event(&sess.device_id, &sess.filename).await {
+                tracing::warn!(error = %e, %sess.device_id, %sess.filename, "publish video_uploaded event failed");
+            }
+            Ok(Json(UploadCompleteResp {
+                ok: true,
+                md5: Some(md5_hex),
+            }))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&sess.temp_path).await;
+            Err(e)
+        }
+    }
 }
