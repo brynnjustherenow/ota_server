@@ -127,7 +127,10 @@ async fn main() {
             get(hardware::http::download_ota_file),
         )
         // 管理端：发布新版本（上传）/ 通知设备升级（MQTT 广播）
-        .route("/ota/{version}/publish", post(service::ota::ota_publish))
+        .route(
+            "/ota/{version}/publish",
+            post(service::ota::ota_publish).layer(DefaultBodyLimit::disable()),
+        )
         .route("/ota/{version}/notify", post(service::ota::ota_update))
         // 管理端：按版本读写 config（sqlite，随 fleet_update 下发 merge）
         .route(
