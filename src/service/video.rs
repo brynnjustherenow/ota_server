@@ -2,7 +2,7 @@ use std::{
     cmp::Reverse,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -254,6 +254,7 @@ pub struct UploadSession {
     file_size: u64,
     temp_path: PathBuf,
     received: u64,
+    created_at: Instant,
 }
 
 #[derive(Deserialize)]
@@ -305,6 +306,11 @@ pub async fn upload_init(
 
     let mut uploads = app_state.uploads.lock().await;
 
+    // 清理 30 分钟以上的孤儿 session（init 后未 complete），避免内存累积。
+    // .partial 临时文件残留不在此删（避免锁内 async IO），磁盘清理另行处理。
+    let stale_cutoff = Instant::now() - Duration::from_secs(1800);
+    uploads.retain(|_, sess| sess.created_at >= stale_cutoff);
+
     // 续传：客户端带上已存在的 upload_id
     if let Some(uid) = req.upload_id.as_deref().filter(|s| !s.is_empty()) {
         if let Some(sess) = uploads.get(uid) {
@@ -326,6 +332,7 @@ pub async fn upload_init(
             file_size: req.file_size,
             temp_path,
             received: 0,
+            created_at: Instant::now(),
         },
     );
     Ok(Json(UploadInitResp {
@@ -354,37 +361,57 @@ pub async fn upload_chunk(
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| OtaError::InvalidInput("缺少/非法 X-Offset".to_string()))?;
 
-    let mut uploads = app_state.uploads.lock().await;
-    let sess = uploads
-        .get_mut(&upload_id)
-        .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {upload_id}")))?;
-
-    if x_offset != sess.received {
-        return Err(OtaError::InvalidInput(format!(
-            "offset 不匹配: 客户端={x_offset} 服务端={}",
-            sess.received
-        )));
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open(&sess.temp_path)
-        .await?;
-    let mut reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    // ① 短暂持锁：校验 offset，取 temp_path，立即释放（避免 body 读取阻塞全局锁）
+    let temp_path = {
+        let uploads = app_state.uploads.lock().await;
+        let sess = uploads
+            .get(&upload_id)
+            .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {upload_id}")))?;
+        if x_offset != sess.received {
+            return Err(OtaError::InvalidInput(format!(
+                "offset 不匹配: 客户端={x_offset} 服务端={}",
+                sess.received
+            )));
         }
-        file.write_all(&buf[..n]).await?;
-        sess.received += n as u64;
+        sess.temp_path.clone()
+    };
+
+    // ② 无锁：读 body 写文件。带 60s 超时，防止半开连接无限 await 拖死全局锁。
+    let received: u64 = async {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&temp_path)
+            .await?;
+        let mut reader =
+            StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut received = x_offset;
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(60), reader.read(&mut buf))
+                .await
+                .map_err(|_| OtaError::InvalidInput("读取分片超时(60s)".to_string()))??;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).await?;
+            received += n as u64;
+        }
+        file.flush().await?;
+        Ok::<u64, OtaError>(received)
     }
-    file.flush().await?;
+    .await?;
+
+    // ③ 短暂持锁：回写 received
+    {
+        let mut uploads = app_state.uploads.lock().await;
+        if let Some(sess) = uploads.get_mut(&upload_id) {
+            sess.received = received;
+        }
+    }
 
     Ok(Json(UploadChunkResp {
-        offset: sess.received,
+        offset: received,
     }))
 }
 
