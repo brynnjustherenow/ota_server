@@ -8,7 +8,7 @@ export default defineConfig({
     proxy: {
       // 所有 /api 请求转发到后端，避免 CORS
       "/api": {
-        target: "http://otapi.kukac.cloud",
+        target: "http://localhost:13884",
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ""),
       },
