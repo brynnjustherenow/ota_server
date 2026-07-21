@@ -150,12 +150,15 @@ async fn main() {
             get(service::video::download_video),
         )
         // 设备端：三段式分片上传（init / chunk / complete）
-        .route("/upload/init", post(service::video::upload_init))
+        .route("/mouseVideoUpload/init", post(service::video::upload_init))
         .route(
-            "/upload/chunk",
+            "/mouseVideoUpload/chunk",
             put(service::video::upload_chunk).layer(DefaultBodyLimit::disable()),
         )
-        .route("/upload/complete", post(service::video::upload_complete))
+        .route(
+            "/mouseVideoUpload/complete",
+            post(service::video::upload_complete),
+        )
         .with_state(app_state)
         .layer(cors);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
