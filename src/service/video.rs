@@ -6,11 +6,11 @@ use std::{
 };
 
 use axum::{
-    Json,
+    Form, Json,
     body::Body,
-    extract::{Path as AxumPath, State},
-    http::HeaderMap,
-    response::Response as AxumResponse,
+    extract::{Multipart, Path as AxumPath, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response as AxumResponse},
 };
 use chrono::Local;
 use futures_util::TryStreamExt;
@@ -22,7 +22,10 @@ use tokio::{
 };
 use tokio_util::io::StreamReader;
 
-use crate::{AppState, service::{OtaError, Response}};
+use crate::{
+    AppState,
+    service::{OtaError, Response},
+};
 
 #[derive(Serialize)]
 pub struct VideoInfo {
@@ -233,142 +236,235 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-// ===================== 三段式分片上传（init / chunk / complete）=====================
-// 设备端 upload_client.py 期望扁平 JSON 响应（{upload_id, offset} 顶层），
-// 故这三个端点直返 Json<T>，不套 Response<T>；错误仍走 OtaError（{code,message,data:null}）。
+// ===================== 三段式分片上传（init / chunk / complete / clean）=====================
+// 适配新协议（rat.caasai.com 风格）：
+//   - 字段名 camelCase（devSerial / fileSize / uploadId / chunkSize）
+//   - 响应统一 {code, msg, status, data}，HTTP 永远 200
+//   - chunk 用 multipart/form-data（field name = "chunk"）
+//   - complete 用 form-urlencoded（uploadId）
+//   - 新增 /clean 接口清空上传记录
+//   - chunk 响应 data 是裸整数 offset（与原 Java 服务端一致）
+
+// ---------- 统一响应包装 ----------
+
+#[derive(Serialize)]
+pub struct VideoResp<T: Serialize> {
+    code: i16,
+    msg: String,
+    status: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+}
+
+impl<T: Serialize> VideoResp<T> {
+    fn success(data: T) -> Self {
+        Self {
+            code: 200,
+            msg: "success".to_string(),
+            status: true,
+            data: Some(data),
+        }
+    }
+}
+
+/// 业务错误：HTTP 仍返回 200，业务错误用 body.code != 200 && status = false 表示。
+/// 这样客户端无论何种失败都能解析响应体，统一处理。
+pub enum VideoError {
+    Bad(String),
+    Internal(String),
+}
+
+impl From<std::io::Error> for VideoError {
+    fn from(e: std::io::Error) -> Self {
+        VideoError::Internal(format!("io: {e}"))
+    }
+}
+
+impl IntoResponse for VideoError {
+    fn into_response(self) -> AxumResponse {
+        let (code, msg) = match self {
+            VideoError::Bad(m) => (400i16, m),
+            VideoError::Internal(m) => (500, m),
+        };
+        let body = serde_json::json!({
+            "code": code,
+            "msg": msg,
+            "status": false,
+            "data": serde_json::Value::Null,
+        });
+        // 关键：HTTP 永远 200，业务错误看 body.code
+        (StatusCode::OK, Json(body)).into_response()
+    }
+}
+
+// ---------- 生成 uploadId ----------
 
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn gen_upload_id() -> String {
-    let ts = SystemTime::now()
+    // 与原 Java 服务端格式一致： yyyyMMddHHmmss + 6 位计数器，便于日志对齐
+    let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let c = UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
+    format!("{ts}{c:06}")
+}
+
+/// 8 位随机十六进制，用于 fileUrl 防重
+fn rand_hex8() -> String {
+    let n = UPLOAD_COUNTER.fetch_add(7, Ordering::Relaxed);
+    let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let c = UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("up_{ts}_{c}")
+    format!("{:08x}", (n ^ t) & 0xFFFF_FFFF)
 }
 
 pub struct UploadSession {
     device_id: String,
     filename: String,
     file_size: u64,
+    chunk_size: u64,
     temp_path: PathBuf,
     received: u64,
     created_at: Instant,
 }
 
+// ---------- init ----------
+
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadInitReq {
-    pub device_id: String,
-    pub filename: String,
-    pub file_size: u64,
     pub upload_id: Option<String>,
+    pub dev_serial: String,
+    pub file_size: f64,
+    pub filename: String,
+    pub chunk_size: Option<f64>,
 }
 
 #[derive(Serialize)]
-pub struct UploadInitResp {
-    pub upload_id: String,
-    pub offset: u64,
+#[serde(rename_all = "camelCase")]
+pub struct InitData {
+    upload_id: String,
+    filename: Option<String>,
+    directory: Option<String>,
+    dev_serial: Option<String>,
+    offset: u64,
+    chunk_size: u64,
+    total_parts: Option<u64>,
+    file_size: Option<u64>,
+    ok: Option<bool>,
+    file_url: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct UploadChunkResp {
-    pub offset: u64,
-}
-
-#[derive(Deserialize)]
-pub struct UploadCompleteReq {
-    pub upload_id: String,
-}
-
-#[derive(Serialize)]
-pub struct UploadCompleteResp {
-    pub ok: bool,
-    pub md5: Option<String>,
-}
-
-/// POST /upload/init
-/// 新建或续传上传会话。返回 upload_id 与起始 offset（0 表新传，>0 表续传）。
-/// 响应扁平：{"upload_id": "...", "offset": N}
+/// POST /{base}/{biz}/init
+/// 新建或续传上传会话。响应 data: {uploadId, offset, chunkSize, ...}
 pub async fn upload_init(
     State(app_state): State<AppState>,
     Json(req): Json<UploadInitReq>,
-) -> Result<Json<UploadInitResp>, OtaError> {
-    if !is_safe_name(&req.device_id) {
-        return Err(OtaError::InvalidInput(format!("非法 device_id: {}", req.device_id)));
+) -> Result<Json<VideoResp<InitData>>, VideoError> {
+    if !is_safe_name(&req.dev_serial) {
+        return Err(VideoError::Bad(format!(
+            "非法 devSerial: {}",
+            req.dev_serial
+        )));
     }
     if !is_safe_name(&req.filename) {
-        return Err(OtaError::InvalidInput(format!("非法 filename: {}", req.filename)));
+        return Err(VideoError::Bad(format!("非法 filename: {}", req.filename)));
     }
 
-    let dir = Path::new("video").join(&req.device_id);
+    let file_size = req.file_size as u64;
+    let chunk_size = req.chunk_size.map(|v| v as u64).unwrap_or(5 * 1024 * 1024);
+
+    let dir = Path::new("video").join(&req.dev_serial);
     fs::create_dir_all(&dir).await?;
 
     let mut uploads = app_state.uploads.lock().await;
 
-    // 清理 30 分钟以上的孤儿 session（init 后未 complete），避免内存累积。
-    // .partial 临时文件残留不在此删（避免锁内 async IO），磁盘清理另行处理。
+    // 清理 30 分钟以上的孤儿 session
     let stale_cutoff = Instant::now() - Duration::from_secs(1800);
     uploads.retain(|_, sess| sess.created_at >= stale_cutoff);
 
     // 续传：客户端带上已存在的 upload_id
-    if let Some(uid) = req.upload_id.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(uid) = req
+        .upload_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
         if let Some(sess) = uploads.get(uid) {
-            return Ok(Json(UploadInitResp {
+            return Ok(Json(VideoResp::success(InitData {
                 upload_id: uid.to_string(),
+                filename: Some(sess.filename.clone()),
+                directory: None,
+                dev_serial: Some(sess.device_id.clone()),
                 offset: sess.received,
-            }));
+                chunk_size: sess.chunk_size,
+                total_parts: None,
+                file_size: Some(sess.file_size),
+                ok: None,
+                file_url: None,
+            })));
         }
     }
 
     let upload_id = gen_upload_id();
     let temp_path = dir.join(format!(".{upload_id}.partial"));
-    fs::File::create(&temp_path).await?; // 创建空文件，覆盖可能残留
+    fs::File::create(&temp_path).await?;
     uploads.insert(
         upload_id.clone(),
         UploadSession {
-            device_id: req.device_id,
-            filename: req.filename,
-            file_size: req.file_size,
+            device_id: req.dev_serial.clone(),
+            filename: req.filename.clone(),
+            file_size,
+            chunk_size,
             temp_path,
             received: 0,
             created_at: Instant::now(),
         },
     );
-    Ok(Json(UploadInitResp {
+
+    Ok(Json(VideoResp::success(InitData {
         upload_id,
+        filename: Some(req.filename),
+        directory: None,
+        dev_serial: Some(req.dev_serial),
         offset: 0,
-    }))
+        chunk_size,
+        total_parts: None,
+        file_size: Some(file_size),
+        ok: None,
+        file_url: None,
+    })))
 }
 
-/// PUT /upload/chunk
-/// 追加写入分片。X-Offset 必须等于服务端已收字节数，否则拒绝。
-/// 响应扁平：{"offset": N}
+// ---------- chunk ----------
+
+/// PUT /{base}/{biz}/chunk
+/// multipart/form-data，字段名 chunk。Header: X-Offset, X-Upload-Id [, X-part-number]
+/// 响应 data: 裸整数 offset（与原 Java 服务端行为一致）
 pub async fn upload_chunk(
     State(app_state): State<AppState>,
     headers: HeaderMap,
-    body: Body,
-) -> Result<Json<UploadChunkResp>, OtaError> {
+    mut multipart: Multipart,
+) -> Result<Json<VideoResp<u64>>, VideoError> {
     let upload_id = headers
         .get("x-upload-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| OtaError::InvalidInput("缺少 X-Upload-Id".to_string()))?
+        .ok_or_else(|| VideoError::Bad("缺少 X-Upload-Id".to_string()))?
         .to_string();
     let x_offset = headers
         .get("x-offset")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| OtaError::InvalidInput("缺少/非法 X-Offset".to_string()))?;
+        .ok_or_else(|| VideoError::Bad("缺少/非法 X-Offset".to_string()))?;
 
-    // ① 短暂持锁：校验 offset，取 temp_path，立即释放（避免 body 读取阻塞全局锁）
+    // ① 短暂持锁：校验 offset，取 temp_path，立即释放
     let temp_path = {
         let uploads = app_state.uploads.lock().await;
         let sess = uploads
             .get(&upload_id)
-            .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {upload_id}")))?;
+            .ok_or_else(|| VideoError::Bad(format!("未知 uploadId: {upload_id}")))?;
         if x_offset != sess.received {
-            return Err(OtaError::InvalidInput(format!(
+            return Err(VideoError::Bad(format!(
                 "offset 不匹配: 客户端={x_offset} 服务端={}",
                 sess.received
             )));
@@ -376,31 +472,53 @@ pub async fn upload_chunk(
         sess.temp_path.clone()
     };
 
-    // ② 无锁：读 body 写文件。带 60s 超时，防止半开连接无限 await 拖死全局锁。
-    let received: u64 = async {
+    // ② 无锁：从 multipart 里读 chunk field 写文件
+    let mut received = x_offset;
+    {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .append(true)
             .open(&temp_path)
             .await?;
-        let mut reader =
-            StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-        let mut buf = vec![0u8; 16 * 1024];
-        let mut received = x_offset;
-        loop {
-            let n = tokio::time::timeout(Duration::from_secs(60), reader.read(&mut buf))
-                .await
-                .map_err(|_| OtaError::InvalidInput("读取分片超时(60s)".to_string()))??;
-            if n == 0 {
-                break;
+        let mut found_chunk = false;
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| VideoError::Bad(format!("multipart 解析失败: {e}")))?
+        {
+            let name = field.name().unwrap_or("").to_string();
+            if name != "chunk" {
+                continue;
             }
-            file.write_all(&buf[..n]).await?;
-            received += n as u64;
+            found_chunk = true;
+            let mut field = field;
+            loop {
+                // field.chunk() 返回 Result<Option<Bytes>, MultipartError>
+                // None 表示该 field 已读完；timeout 包一层后是 Result<Result<Option<Bytes>, _>, Elapsed>
+                let chunk_result =
+                    tokio::time::timeout(Duration::from_secs(60), field.chunk()).await;
+                let chunk_opt = match chunk_result {
+                    Err(_) => return Err(VideoError::Bad("读取分片超时(60s)".to_string())),
+                    Ok(Err(e)) => {
+                        return Err(VideoError::Bad(format!("chunk field 错误: {e}")))
+                    }
+                    Ok(Ok(opt)) => opt,
+                };
+                let chunk_bytes = match chunk_opt {
+                    None => break,
+                    Some(b) => b,
+                };
+                file.write_all(&chunk_bytes).await?;
+                received += chunk_bytes.len() as u64;
+            }
+        }
+        if !found_chunk {
+            return Err(VideoError::Bad(
+                "multipart body 缺少 chunk 字段".to_string(),
+            ));
         }
         file.flush().await?;
-        Ok::<u64, OtaError>(received)
     }
-    .await?;
 
     // ③ 短暂持锁：回写 received
     {
@@ -410,70 +528,126 @@ pub async fn upload_chunk(
         }
     }
 
-    Ok(Json(UploadChunkResp {
-        offset: received,
-    }))
+    Ok(Json(VideoResp::success(received)))
 }
 
-/// POST /upload/complete
-/// 完成上传：校验大小、计算 MD5、原子 rename、广播 MQTT 事件。
-/// 响应扁平：{"ok": true, "md5": "..."}
+// ---------- complete ----------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadCompleteReq {
+    pub upload_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteData {
+    ok: bool,
+    file_url: String,
+    upload_id: String,
+}
+
+/// POST /{base}/{biz}/complete
+/// form-urlencoded: uploadId=...
+/// 响应 data: {ok: true, fileUrl: "videos/<devSerial>/<filename>", uploadId: "..."}
 pub async fn upload_complete(
     State(app_state): State<AppState>,
-    Json(req): Json<UploadCompleteReq>,
-) -> Result<Json<UploadCompleteResp>, OtaError> {
+    Form(req): Form<UploadCompleteReq>,
+) -> Result<Json<VideoResp<CompleteData>>, VideoError> {
+    complete_impl(app_state, req.upload_id).await
+}
+
+async fn complete_impl(
+    app_state: AppState,
+    upload_id: String,
+) -> Result<Json<VideoResp<CompleteData>>, VideoError> {
     let sess = {
         let mut uploads = app_state.uploads.lock().await;
         uploads
-            .remove(&req.upload_id)
-            .ok_or_else(|| OtaError::InvalidInput(format!("未知 upload_id: {}", req.upload_id)))?
+            .remove(&upload_id)
+            .ok_or_else(|| VideoError::Bad(format!("未知 uploadId: {upload_id}")))?
     };
 
     let dir = Path::new("video").join(&sess.device_id);
     let final_path = dir.join(&sess.filename);
+    // fileUrl 是相对路径，对外暴露（与原 Java 服务端格式一致）
+    let file_url = format!("videos/{}/{}", sess.device_id, sess.filename);
 
-    let result: Result<String, OtaError> = async {
+    let result: Result<(), VideoError> = async {
         if sess.received != sess.file_size {
-            return Err(OtaError::InvalidInput(format!(
+            return Err(VideoError::Bad(format!(
                 "大小不符: 已收={} 声明={}",
                 sess.received, sess.file_size
             )));
         }
-        // 计算 MD5（读一遍 partial）
-        let mut f = fs::File::open(&sess.temp_path).await?;
-        let mut hasher = Md5::new();
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = f.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        let md5_hex = format!("{:x}", hasher.finalize());
-
         // 原子提交：删旧 → rename
         if fs::try_exists(&final_path).await? {
             fs::remove_file(&final_path).await?;
         }
         fs::rename(&sess.temp_path, &final_path).await?;
-        Ok(md5_hex)
+        Ok(())
     }
     .await;
 
     match result {
-        Ok(md5_hex) => {
-            if let Err(e) = app_state.send_video_event(&sess.device_id, &sess.filename).await {
-                tracing::warn!(error = %e, %sess.device_id, %sess.filename, "publish video_uploaded event failed");
+        Ok(()) => {
+            if let Err(e) = app_state
+                .send_video_event(&sess.device_id, &sess.filename)
+                .await
+            {
+                tracing::warn!(
+                    error = %e, %sess.device_id, %sess.filename,
+                    "publish video_uploaded event failed"
+                );
             }
-            Ok(Json(UploadCompleteResp {
+            Ok(Json(VideoResp::success(CompleteData {
                 ok: true,
-                md5: Some(md5_hex),
-            }))
+                file_url,
+                upload_id,
+            })))
         }
         Err(e) => {
             let _ = fs::remove_file(&sess.temp_path).await;
             Err(e)
         }
     }
+}
+
+// ---------- clean ----------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadCleanReq {
+    pub upload_id: String,
+}
+
+/// POST /{base}/{biz}/clean
+/// 清空指定 uploadId 的上传记录（删除 .partial 临时文件 + 内存 session）。
+/// 客户端上传异常时主动调 clean，避免下次 init 复用错 offset。
+/// 响应：{code, msg, status}，无 data
+pub async fn upload_clean(
+    State(app_state): State<AppState>,
+    Form(req): Form<UploadCleanReq>,
+) -> Result<Json<VideoResp<()>>, VideoError> {
+    clean_impl(app_state, req.upload_id).await
+}
+
+async fn clean_impl(
+    app_state: AppState,
+    upload_id: String,
+) -> Result<Json<VideoResp<()>>, VideoError> {
+    let sess = {
+        let mut uploads = app_state.uploads.lock().await;
+        uploads.remove(&upload_id)
+    };
+    if let Some(sess) = sess {
+        let _ = fs::remove_file(&sess.temp_path).await;
+    }
+    // 无论 uploadId 是否存在都返回成功（幂等）
+    Ok(Json(VideoResp {
+        code: 200,
+        msg: "操作成功".to_string(),
+        status: true,
+        data: None,
+    }))
 }

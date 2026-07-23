@@ -35,6 +35,9 @@ impl AppState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     port: u16,
+    #[serde(default = "default_mqtt_client_id")]
+    mqtt_client_id: String,
+    #[serde(default)]
     mqtt_conf: MqttConfig,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,9 +51,17 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 13884,
+            mqtt_client_id: default_mqtt_client_id(),
             mqtt_conf: MqttConfig::default(),
         }
     }
+}
+
+/// 生成不冲突的默认 client_id：ota_server-<pid>。
+/// 多实例运行时（PC 调试 + VPS 部署）避免 EMQX 因为相同 client_id 互踢。
+fn default_mqtt_client_id() -> String {
+    let pid = std::process::id();
+    format!("ota_server-{pid}")
 }
 impl Default for MqttConfig {
     fn default() -> Self {
@@ -68,7 +79,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let conf = init_config().await;
-    let client = init_mqtt_client(&conf.mqtt_conf)
+    let client = init_mqtt_client(&conf.mqtt_conf, &conf.mqtt_client_id)
         .await
         .expect("create mqtt client failed");
 
@@ -149,31 +160,53 @@ async fn main() {
             "/video/{device_id}/{filename}",
             get(service::video::download_video),
         )
-        // 设备端：三段式分片上传（init / chunk / complete）
-        .route("/mouseVideoUpload/init", post(service::video::upload_init))
-        .route(
-            "/mouseVideoUpload/chunk",
-            put(service::video::upload_chunk).layer(DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/mouseVideoUpload/complete",
-            post(service::video::upload_complete),
-        )
+        // 设备端：三段式分片上传（init / chunk / complete / clean）
+        // 适配新协议：挂载在 /Mtpi（测试）和 /Mpi（正式）前缀下，
+        // 同时支持 /mouseVideoUpload（新毒饵站）和 /eagleVideoUpload（招鹰架）。
+        // 路由按前缀组织，避免重复定义。
+        .nest("/Mtpi", make_upload_routes())
+        .nest("/Mpi", make_upload_routes())
         .with_state(app_state)
         .layer(cors);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();
+    info!("server listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health() -> (StatusCode) {
-    (StatusCode::OK)
+/// 构造上传路由（mouseVideoUpload + eagleVideoUpload 共用同一组 handler）。
+/// 在 main 里挂载到 /Mtpi 和 /Mpi 两个前缀下。
+/// 设计：handler 内部不关心 base/biz 前缀，URL 解析由 axum nest 负责。
+/// 业务字段（devSerial）由请求体携带，与 biz 路径无关。
+fn make_upload_routes() -> Router<AppState> {
+    let make_biz = |biz: &'static str| -> Router<AppState> {
+        Router::new()
+            .route(&format!("/{biz}/init"), post(service::video::upload_init))
+            .route(
+                &format!("/{biz}/chunk"),
+                put(service::video::upload_chunk).layer(DefaultBodyLimit::disable()),
+            )
+            // 客户端默认走 form-urlencoded（与原 Java 服务端兼容）。
+            // 如果要支持 JSON 入口，在 service::video 里加 _json 变体并改路由分发。
+            .route(
+                &format!("/{biz}/complete"),
+                post(service::video::upload_complete),
+            )
+            .route(&format!("/{biz}/clean"), post(service::video::upload_clean))
+    };
+    make_biz("mouseVideoUpload")
+        .merge(make_biz("eagleVideoUpload"))
+        .merge(make_biz("areatest")) // 兼容历史/其他业务前缀（如 /Mtpi/areatest/...）
+}
+
+async fn health() -> StatusCode {
+    StatusCode::OK
 }
 /// init the mqtt client and subscribe the topics
-async fn init_mqtt_client(config: &MqttConfig) -> Result<MqttClient, String> {
-    let client = mqtt5::MqttClient::new("ota_server");
-    let opts = ConnectOptions::new("ota_server".to_string());
+async fn init_mqtt_client(config: &MqttConfig, client_id: &str) -> Result<MqttClient, String> {
+    let client = mqtt5::MqttClient::new(client_id);
+    let opts = ConnectOptions::new(client_id.to_string());
     let host = &config.server_host;
     let port = config.server_post;
     let status_topic = &config.status_topic;
