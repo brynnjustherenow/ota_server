@@ -18,7 +18,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
 };
 use tokio_util::io::StreamReader;
 
@@ -79,7 +79,9 @@ pub async fn upload_video(
         let (size, md5_hex) = {
             let mut reader =
                 StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-            let mut file = fs::File::create(&staging).await?;
+            // 套 BufWriter：read buffer 虽是 16KB，但 tokio::fs::File 无用户态缓冲，
+            // 每次 write_all 都是 syscall。用 2MB 缓冲合并小写。
+            let mut file = BufWriter::with_capacity(2 * 1024 * 1024, fs::File::create(&staging).await?);
             let mut hasher = Md5::new();
             let mut total: u64 = 0;
             let mut buf = vec![0u8; 16 * 1024];
@@ -475,11 +477,15 @@ pub async fn upload_chunk(
     // ② 无锁：从 multipart 里读 chunk field 写文件
     let mut received = x_offset;
     {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .append(true)
             .open(&temp_path)
             .await?;
+        // 套一层 BufWriter：field.chunk() 每次只有 8-16KB，
+        // 直写 tokio::fs::File 每次都是 syscall。512KB 分片下会有 32-64 次小写，
+        // 用 1MB 缓冲（≈2 个分片）合并成 1-2 次大写，显著降低 I/O 放大。
+        let mut file = BufWriter::with_capacity(1024 * 1024, file);
         let mut found_chunk = false;
         while let Some(field) = multipart
             .next_field()
