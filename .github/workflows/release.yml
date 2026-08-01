@@ -93,6 +93,19 @@ jobs:
           name: frontend-dist
           path: frontend/dist
 
+      - name: Prepare example config
+        shell: bash
+        run: |
+          {
+            echo 'port = 13884'
+            echo ''
+            echo '[mqtt_conf]'
+            echo 'server_host = "broker.emqx.io"'
+            echo 'server_post = 1883'
+            echo 'cmd_topic = "k230/cam/cmd"'
+            echo 'status_topic = "k230/cam/status"'
+          } > conf.toml.example
+
       - name: Install aarch64 cross toolchain
         if: matrix.cross == 'true'
         run: |
@@ -117,7 +130,7 @@ jobs:
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/ota_server" "$STAGE/"
           cp -r frontend/dist "$STAGE/frontend-dist"
-          cp .conf.toml "$STAGE/conf.toml.example"
+          cp conf.toml.example "$STAGE/"
           tar czf "$STAGE.tar.gz" "$STAGE"
           echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
 
@@ -130,7 +143,7 @@ jobs:
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/ota_server.exe" "$STAGE/"
           cp -r frontend/dist "$STAGE/frontend-dist"
-          cp .conf.toml "$STAGE/conf.toml.example"
+          cp conf.toml.example "$STAGE/"
           7z a "$STAGE.zip" "$STAGE"
           echo "ASSET=$STAGE.zip" >> "$GITHUB_ENV"
 
