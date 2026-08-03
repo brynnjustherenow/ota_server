@@ -171,6 +171,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();
+    service::video::cleanup_orphan_partials().await;
     info!("server listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
 }

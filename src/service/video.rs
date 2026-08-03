@@ -381,9 +381,24 @@ pub async fn upload_init(
 
     let mut uploads = app_state.uploads.lock().await;
 
-    // 清理 30 分钟以上的孤儿 session
+    // 清理 30 分钟以上的孤儿 session，同时删除对应的 .partial 临时文件。
+    // 设备重启/网络中断时 complete 和 clean 均不会被调用，.partial 会永久残留
+    // （磁盘泄漏），积累后填满磁盘导致所有上传失败。
     let stale_cutoff = Instant::now() - Duration::from_secs(1800);
-    uploads.retain(|_, sess| sess.created_at >= stale_cutoff);
+    let stale_paths: Vec<PathBuf> = {
+        let mut paths = Vec::new();
+        uploads.retain(|_, sess| {
+            let is_stale = sess.created_at < stale_cutoff;
+            if is_stale {
+                paths.push(sess.temp_path.clone());
+            }
+            !is_stale
+        });
+        paths
+    };
+    for p in &stale_paths {
+        let _ = fs::remove_file(p).await;
+    }
 
     // 续传：客户端带上已存在的 upload_id
     if let Some(uid) = req
@@ -482,6 +497,11 @@ pub async fn upload_chunk(
             .append(true)
             .open(&temp_path)
             .await?;
+        // 截断到已确认 offset，清除上次 chunk 半写残留：
+        // 若上一片 write_all 后、回写 received 前连接断开（设备重启），文件会含半截
+        // 数据而 received 未更新。设备重试同一 offset 时若不截断就 append，会写入
+        // 重复字节，导致最终文件 > file_size、MP4 损坏。set_len 后 append 从新末尾写。
+        file.set_len(x_offset).await?;
         // 套一层 BufWriter：field.chunk() 每次只有 8-16KB，
         // 直写 tokio::fs::File 每次都是 syscall。512KB 分片下会有 32-64 次小写，
         // 用 1MB 缓冲（≈2 个分片）合并成 1-2 次大写，显著降低 I/O 放大。
@@ -656,4 +676,38 @@ async fn clean_impl(
         status: true,
         data: None,
     }))
+}
+
+/// 启动时扫描 video/ 目录，删除所有残留的 .partial 临时文件。
+/// 这些文件来自上次服务运行期间被中断（设备重启/网络中断）的上传——
+/// complete 和 clean 均未触达，文件成为永久孤儿。
+pub async fn cleanup_orphan_partials() {
+    let root = Path::new("video");
+    if !fs::try_exists(root).await.unwrap_or(false) {
+        return;
+    }
+    let mut count = 0u64;
+    let mut entries = match fs::read_dir(root).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(dev_dir)) = entries.next_entry().await {
+        if !dev_dir.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let mut sub = match fs::read_dir(dev_dir.path()).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(f)) = sub.next_entry().await {
+            if f.file_name().to_string_lossy().ends_with(".partial") {
+                if fs::remove_file(f.path()).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count > 0 {
+        tracing::info!("cleaned {} orphan .partial files", count);
+    }
 }
