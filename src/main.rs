@@ -39,6 +39,12 @@ struct Config {
     mqtt_client_id: String,
     #[serde(default)]
     mqtt_conf: MqttConfig,
+    #[serde(default)]
+    bark: BarkConfig,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BarkConfig {
+    key: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MqttConfig {
@@ -53,6 +59,7 @@ impl Default for Config {
             port: 13884,
             mqtt_client_id: default_mqtt_client_id(),
             mqtt_conf: MqttConfig::default(),
+            bark: BarkConfig::default(),
         }
     }
 }
@@ -79,12 +86,10 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let conf = init_config().await;
-    let client = init_mqtt_client(&conf.mqtt_conf, &conf.mqtt_client_id)
-        .await
-        .expect("create mqtt client failed");
-
     let port = conf.port;
-    // SQLite：存储每个版本对应的 config（随 fleet_update 下发 merge）
+    let bark_key = conf.bark.key.clone();
+
+    // SQLite 先于 MQTT 初始化：status 订阅回调需要 db 句柄入库事件
     let db = sqlx::sqlite::SqlitePoolOptions::new()
         .connect_with(
             sqlx::sqlite::SqliteConnectOptions::new()
@@ -99,6 +104,30 @@ async fn main() {
     .execute(&db)
     .await
     .expect("version_config migrate");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS device_events (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         device_id TEXT NOT NULL,\
+         event TEXT NOT NULL,\
+         detail TEXT NOT NULL DEFAULT '',\
+         ev_ts INTEGER NOT NULL DEFAULT 0,\
+         received_at TEXT NOT NULL,\
+         raw TEXT NOT NULL DEFAULT '')",
+    )
+    .execute(&db)
+    .await
+    .expect("device_events migrate");
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_device ON device_events(device_id, id)",
+    )
+    .execute(&db)
+    .await
+    .expect("device_events index");
+
+    let client = init_mqtt_client(&conf.mqtt_conf, &conf.mqtt_client_id, db.clone(), bark_key)
+        .await
+        .expect("create mqtt client failed");
+
     let app_state = AppState {
         ota_client: client,
         db,
@@ -126,6 +155,8 @@ async fn main() {
         .max_age(Duration::from_secs(3600));
     let app = Router::new()
         .route("/health", get(health))
+        // 设备生命周期事件：BOOT/RESET/APP_START（最近 N 条）
+        .route("/events", get(service::event::list_events))
         // OTA：列出所有版本 / 拉清单 / 下载
         .route("/ota", get(service::ota::list_versions))
         // 设备端：拉取清单 / 下载文件
@@ -205,7 +236,12 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 /// init the mqtt client and subscribe the topics
-async fn init_mqtt_client(config: &MqttConfig, client_id: &str) -> Result<MqttClient, String> {
+async fn init_mqtt_client(
+    config: &MqttConfig,
+    client_id: &str,
+    db: sqlx::SqlitePool,
+    bark_key: String,
+) -> Result<MqttClient, String> {
     let client = mqtt5::MqttClient::new(client_id);
     let opts = ConnectOptions::new(client_id.to_string());
     let host = &config.server_host;
@@ -217,13 +253,21 @@ async fn init_mqtt_client(config: &MqttConfig, client_id: &str) -> Result<MqttCl
         .connect_with_options(&uri, opts)
         .await
         .map_err(|e| e.to_string())?;
-    // subscribe the status topic
+    // subscribe the status topic：解析 ev 事件 → 入库 → 按需 Bark 推送
+    let db_status = db.clone();
+    let bark_key_status = bark_key.clone();
     if client
-        .subscribe(status_topic, |message| {
-            let topic = message.topic;
-            let message = message.payload;
-            let message = String::from_utf8(message).expect("Found invalid UTF-8");
-            info!("recv message from topic [{topic}],content is [{message}]");
+        .subscribe(status_topic, move |message| {
+            let payload = String::from_utf8_lossy(&message.payload).to_string();
+            let db = db_status.clone();
+            let bark_key = bark_key_status.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    hardware::event::handle_status_message(&db, &bark_key, &payload).await
+                {
+                    warn!("[EVENT] handle failed: {e}");
+                }
+            });
         })
         .await
         .is_err()

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::error;
 
+pub mod event;
 pub mod http;
 pub mod ota;
 pub mod util;
