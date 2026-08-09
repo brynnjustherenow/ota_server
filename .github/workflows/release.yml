@@ -174,3 +174,78 @@ jobs:
           files: |
             ota_server-*.tar.gz
             ota_server-*.zip
+
+  # 发布成功后通过 SSH 自动部署到服务器
+  # 暂时禁用：以后启用时删除下面 if: false 这一行即可
+  deploy:
+    if: false  # 暂时禁用，保留代码待以后启用
+    needs: [meta, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ needs.meta.outputs.tag }}" \
+            -R "$GITHUB_REPOSITORY" \
+            --pattern 'ota_server-*-x86_64-unknown-linux-gnu.tar.gz' \
+            --dir ./dist
+          mv ./dist/ota_server-*-x86_64-unknown-linux-gnu.tar.gz ./ota_server.tar.gz
+          ls -la ota_server.tar.gz
+
+      - name: Upload archive to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: ota_server.tar.gz
+          target: /tmp/ota_deploy
+
+      - name: Install & restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            DEST="$HOME/ota_server"
+            mkdir -p "$DEST"
+            # 备份当前二进制，便于失败回滚
+            if [ -f "$DEST/ota_server" ]; then
+              cp "$DEST/ota_server" "$DEST/ota_server.bak"
+            fi
+            # 解压到临时目录
+            TMP=$(mktemp -d)
+            tar xzf /tmp/ota_deploy/ota_server.tar.gz -C "$TMP" --strip-components=1
+            # 更新示例配置（不覆盖已存在的 .conf.toml）
+            cp -n "$TMP/conf.toml.example" "$DEST/" 2>/dev/null || true
+            # 替换二进制
+            install -m 0755 "$TMP/ota_server" "$DEST/ota_server"
+            # 更新前端静态资源
+            rm -rf "$DEST/frontend-dist"
+            cp -r "$TMP/frontend-dist" "$DEST/frontend-dist"
+            # 重启服务（需在 sudoers 配 NOPASSWD）
+            sudo systemctl restart ota_server
+            # 健康检查（最多重试 5 次），失败则回滚
+            sleep 2
+            for i in 1 2 3 4 5; do
+              if curl -fsS http://127.0.0.1:13884/health >/dev/null; then
+                echo "health OK"
+                rm -rf "$TMP" /tmp/ota_deploy
+                echo "Deployed ${{ needs.meta.outputs.tag }} successfully"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "health check failed, rolling back"
+            if [ -f "$DEST/ota_server.bak" ]; then
+              install -m 0755 "$DEST/ota_server.bak" "$DEST/ota_server"
+              sudo systemctl restart ota_server
+            fi
+            exit 1
