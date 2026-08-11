@@ -1,0 +1,135 @@
+{
+  "version": "2.1.0",
+  "device_id": "CAM001",
+  "boot_delay_sec": 0,
+  "uart_log": {
+    "enabled": true,
+    "board": "01studio_uart3",
+    "uart_id": 3,
+    "tx_pin": 50,
+    "rx_pin": 51,
+    "baudrate": 115200,
+    "mirror_usb": true
+  },
+  "run_mode": "app_main.py",
+  "work_mode": "sample",
+  "ota_host": "api.entropycommiot.com",
+  "ota_port": 13884,
+  "ota_path": "/ota/config.json",
+  "ota_policy": {
+    "check_interval_sec": 86400
+  },
+  "network": {
+    "lazy_connect": true,
+    "fast_probe_sec": 3,
+    "ntp_interval_sec": 86400,
+    "ntp_require_bringup": true
+  },
+  "storage_policy": {
+    "min_space_mb": 100,
+    "estimated_clip_mb": 30,
+    "max_video_count": 500,
+    "evict_fifo_enabled": true
+  },
+  "mqtt": {
+    "enabled": true,
+    "server": "broker.emqx.io",
+    "port": 1883,
+    "client_id": "K230_Cam_Node",
+    "pub_topic": "k230/cam/status",
+    "sub_topic": "k230/cam/cmd",
+    "always_on": false,
+    "listen_window_sec": 30,
+    "telemetry_interval_sec": 300
+  },
+  "app_params": {
+    "record_width": 1920,
+    "record_height": 1080,
+    "record_duration": 10,
+    "sleep_interval": 30,
+    "patrol_listen_interval_sec": 300,
+    "upload_interval_sec": 60,
+    "sensor_csi_id": 2,
+    "sensor_fps": 60,
+    "night_adc_channel": 1,
+    "night_uv_threshold": 100000,
+    "adc0_channel": 0,
+    "debug_night_toggle": false,
+    "min_space_mb": 100,
+    "estimated_clip_mb": 30,
+    "hw_watchdog_timeout_sec": 120,
+    "hang_detect_ms": 28000,
+    "post_action": "reboot",
+    "gpio_irq_mode_switch": -1,
+    "gpio_irq_aux": -1,
+    "gpio_irq_edge": "falling",
+    "gpio_irq_debounce_ms": 200,
+    "gpio_led1": -1,
+    "gpio_led2": -1
+  },
+  "ai_params": {
+    "engine": "yolo11",
+    "kmodel_path": "/sdcard/exp_ptq0.kmodel",
+    "model_input_size": [320, 320],
+    "ai_frame_size": [640, 640],
+    "labels": ["mouse"],
+    "target_classes": [0],
+    "conf_threshold": 0.7,
+    "nms_threshold": 0.45,
+    "ai_debug": false,
+    "always_wait_timeout": true,
+    "ai_grayscale_input": true,
+    "confirm_frames": 3,
+    "miss_frames": 3,
+    "ai_check_ms": 500,
+    "min_record_sec": 1,
+    "max_record_sec": 10,
+    "record_width": 1920,
+    "record_height": 1080,
+    "sensor_fps": 30,
+    "ai_fps": 15,
+    "max_watch_hours": 0,
+    "mem_guard_mb": 30
+  },
+  "delivery": {
+    "mode": "upload",
+    "upload": {
+      "enabled": true,
+      "upload_async": false,
+      "host": "api.entropycommiot.com",
+      "tls": true,
+      "base_path": "/Mtpi",
+      "biz": "/mouseVideoUpload",
+      "chunk_size": 524288,
+      "delete_after_upload": true,
+      "clean_on_fail": true
+    }
+  },
+  "gps": {
+    "enabled": true,
+    "uart_id": 1,
+    "tx_pin": 3,
+    "rx_pin": 4,
+    "baudrate": 38400,
+    "read_interval_ms": 20
+  },
+  "sensors": {
+    "enabled": true,
+    "poll_interval_sec": 5,
+    "aht20": {
+      "enabled": true,
+      "i2c_id": 2,
+      "scl_pin": 11,
+      "sda_pin": 12,
+      "freq": 100000,
+      "addr": 56
+    },
+    "core_temp": {
+      "enabled": true
+    }
+  },
+  "env_report": {
+    "enabled": true,
+    "interval_sec": 60
+  }
+}

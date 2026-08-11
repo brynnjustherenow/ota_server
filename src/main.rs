@@ -104,6 +104,17 @@ async fn main() {
     .execute(&db)
     .await
     .expect("version_config migrate");
+    // 设备专属 config：按 (version, device_id) 唯一。下发时携带 device_id，仅匹配设备应用。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS device_version_config (\
+         version TEXT NOT NULL,\
+         device_id TEXT NOT NULL,\
+         config TEXT NOT NULL,\
+         PRIMARY KEY (version, device_id))",
+    )
+    .execute(&db)
+    .await
+    .expect("device_version_config migrate");
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS device_events (\
          id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -134,8 +145,8 @@ async fn main() {
         config: conf,
         uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-    // 每 10 分钟广播最新版本（retained），设备订阅即收
-    hardware::mqtt::interval_publish_service(&app_state);
+    // 不再定时广播：retained 消息会保留在 broker，设备订阅即收到最后一条。
+    // 全局在 cmd_topic，设备专属在 cmd_topic/{device_id}，互不覆盖。
     let cors = CorsLayer::new()
         // 只允许特定域名
         .allow_origin(Any)
@@ -179,6 +190,23 @@ async fn main() {
             "/ota/{version}/config",
             get(service::ota::get_version_config).post(service::ota::set_version_config),
         )
+        // 管理端：设备专属 config（按 device_id 区分，发布时携带 device_id）
+        .route(
+            "/ota/{version}/devices",
+            get(service::ota::list_device_configs),
+        )
+        .route(
+            "/ota/{version}/config/{device_id}",
+            get(service::ota::get_device_config)
+                .post(service::ota::set_device_config)
+                .delete(service::ota::delete_device_config),
+        )
+        .route(
+            "/ota/{version}/publish_device/{device_id}",
+            post(service::ota::publish_device_config),
+        )
+        // 设备 config 模板（来自项目根 device_cfg.json）
+        .route("/ota/template", get(service::ota::get_config_template))
         // 设备端：上传/列出/下载视频（关闭默认 2MB body 限制）
         .route("/video", get(service::video::list_devices))
         .route(

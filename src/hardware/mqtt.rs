@@ -1,12 +1,8 @@
-use std::time::{Duration, Instant};
-
 use axum::http::StatusCode;
 use chrono::Local;
 use mqtt5::{Message, MqttClient, PublishOptions, callback};
 use postcard::{Error, to_vec};
 use serde::{Deserialize, Serialize};
-use tokio::time::interval;
-use tracing::{info, warn};
 
 use crate::{AppState, service::OtaError};
 impl AppState {
@@ -31,7 +27,7 @@ impl AppState {
         Ok(())
     }
     pub async fn send_version(&self, version: String) -> Result<(), OtaError> {
-        self.send_fleet_update(&version, None).await
+        self.send_fleet_update(&version, None, None).await
     }
 
     /// 发布 retained 消息：同 topic 仅保留最后一条，故版本与配置合并为 fleet_update。
@@ -42,20 +38,42 @@ impl AppState {
         Ok(())
     }
 
-    /// 合并下发版本号 + 可选配置（设备收到后触发 OTA 比对 + config merge）。
+    /// 合并下发版本号 + 可选配置（retained 广播）。
+    ///
+    /// topic 路由（避免全局与设备专属 retained 互相覆盖，retained 按 topic 各存最后一条）：
+    /// - `device_id` 非空 → `{cmd_topic}/{device_id}`：仅该设备订阅，专属 retained
+    /// - `device_id` 为空 → `cmd_topic`：全局 retained
+    ///
+    /// 设备端「优先专属、回退全局」即可，无需 deep_merge。
+    /// payload 带 device_id 字段供设备端防御性校验。
     pub async fn send_fleet_update(
         &self,
         version: &str,
         config: Option<&serde_json::Value>,
+        device_id: Option<&str>,
     ) -> Result<(), OtaError> {
-        let topic = &self.config.mqtt_conf.cmd_topic;
-        let payload = match config {
-            Some(c) => serde_json::json!({ "cmd": "fleet_update", "version": version, "config": c }),
-            None => serde_json::json!({ "cmd": "fleet_update", "version": version }),
+        let base = &self.config.mqtt_conf.cmd_topic;
+        let did = device_id.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let topic = match did {
+            Some(d) => format!("{base}/{d}"),
+            None => base.clone(),
         };
+        let mut payload = serde_json::json!({ "cmd": "fleet_update", "version": version });
+        if let Some(c) = config {
+            payload["config"] = c.clone();
+        }
+        if let Some(d) = did {
+            payload["device_id"] = serde_json::Value::String(d.to_string());
+        }
         let payload = serde_json::to_vec(&payload)
             .map_err(|e| OtaError::InvalidInput(format!("序列化 fleet_update 失败: {e}")))?;
-        self.publish_retained(topic, payload).await
+        self.publish_retained(&topic, payload).await
+    }
+
+    /// 清空某 topic 的 retained 消息（MQTT 语义：零长度 payload 的 retained PUBLISH
+    /// 会删除 broker 上该 topic 的 retained）。用于删除设备专属配置时清理残留。
+    pub async fn clear_retained(&self, topic: &str) -> Result<(), OtaError> {
+        self.publish_retained(topic, Vec::new()).await
     }
 
     pub async fn send_video_event(&self, device_id: &str, filename: &str) -> Result<(), OtaError> {
@@ -149,34 +167,4 @@ pub fn split_rel_path(rel: &str) -> (String, String) {
         Some(idx) => (rel[..idx].to_string(), rel[idx + 1..].to_string()),
         None => (String::new(), rel.to_string()),
     }
-}
-/// 每 10 分钟检测最新已发布版本，合并其 config（sqlite）后以 retained 广播。
-/// 设备每次订阅 cmd topic 即收到最后一条 fleet_update，无需服务端精确把握设备在线时刻。
-pub fn interval_publish_service(app_state: &AppState) {
-    let app = app_state.clone();
-    tokio::spawn(async move {
-        // interval 首次 tick 立即触发，之后每 10 分钟一次
-        let mut interval = interval(Duration::from_secs(600));
-        loop {
-            interval.tick().await;
-            match crate::service::ota::latest_published_version().await {
-                Some(version) => {
-                    let decision =
-                        crate::service::ota::resolve_broadcast(&app.db, &version).await;
-                    if decision.skip {
-                        info!(
-                            "version {version} 文件夹为空且无 config，跳过广播（保留上一条 retained）"
-                        );
-                        continue;
-                    }
-                    if app.send_fleet_update(&version, decision.config.as_ref()).await.is_err() {
-                        warn!("fleet_update publish failed");
-                    } else {
-                        info!("fleet_update broadcast version={version}");
-                    }
-                }
-                None => info!("no published version yet, skip"),
-            }
-        }
-    });
 }

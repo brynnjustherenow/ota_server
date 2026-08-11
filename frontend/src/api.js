@@ -201,10 +201,21 @@ export async function downloadOtaFile(version, relPath, etag = null) {
 
 /**
  * 触发 MQTT 广播
+ * @param {string} version
+ * @param {string} [deviceId]  可选；非空时 payload 带 device_id，仅匹配设备应用
+ * @param {boolean} [carryDeviceConfig]  仅当 deviceId 非空时有意义：
+ *   true=携带设备专属 config（无则退回全局）；false=忽略设备 config 退回全局。默认 true。
  */
-export async function notifyOta(version) {
+export async function notifyOta(version, deviceId, carryDeviceConfig) {
+  const params = new URLSearchParams();
+  const did = deviceId && deviceId.trim();
+  if (did) params.set("device_id", did);
+  if (did && carryDeviceConfig !== undefined) {
+    params.set("carry_device_config", String(carryDeviceConfig));
+  }
+  const qs = params.toString();
   const resp = await fetch(
-    `${BASE}/ota/${encodeURIComponent(version)}/notify`,
+    `${BASE}/ota/${encodeURIComponent(version)}/notify${qs ? `?${qs}` : ""}`,
     { method: "POST" },
   );
   return parseBody(resp);
@@ -228,6 +239,80 @@ export async function getVersionConfig(version) {
 export async function setVersionConfig(version, configObj) {
   const resp = await fetch(
     `${BASE}/ota/${encodeURIComponent(version)}/config`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: configObj }),
+    },
+  );
+  return parseBody(resp);
+}
+
+// ─────────────── 设备 config 模板 ───────────────
+
+/**
+ * 拉取设备 config 模板（来自项目根 device_cfg.json）
+ */
+export async function getConfigTemplate() {
+  const resp = await fetch(`${BASE}/ota/template`);
+  return parseBody(resp);
+}
+
+// ─────────────── 设备专属 config ───────────────
+
+/**
+ * 列出某版本下已配置过的 device_id
+ */
+export async function listDeviceConfigs(version) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/devices`,
+  );
+  return parseBody(resp);
+}
+
+/**
+ * 读取某版本下某设备的专属 config
+ */
+export async function getDeviceConfig(version, deviceId) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/config/${encodeURIComponent(deviceId)}`,
+  );
+  return parseBody(resp);
+}
+
+/**
+ * 保存某版本下某设备的专属 config（不广播）
+ */
+export async function setDeviceConfig(version, deviceId, configObj) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/config/${encodeURIComponent(deviceId)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: configObj }),
+    },
+  );
+  return parseBody(resp);
+}
+
+/**
+ * 删除某版本下某设备的专属 config
+ */
+export async function deleteDeviceConfig(version, deviceId) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/config/${encodeURIComponent(deviceId)}`,
+    { method: "DELETE" },
+  );
+  return parseBody(resp);
+}
+
+/**
+ * 发布（保存 + 广播）某版本下某设备的 config。
+ * 服务端会下发带 device_id 的 fleet_update，仅匹配设备应用。
+ */
+export async function publishDeviceConfig(version, deviceId, configObj) {
+  const resp = await fetch(
+    `${BASE}/ota/${encodeURIComponent(version)}/publish_device/${encodeURIComponent(deviceId)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

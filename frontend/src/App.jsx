@@ -18,7 +18,7 @@ import OtaDownloadPage from "./pages/OtaDownload.jsx";
 import OtaNotifyPage from "./pages/OtaNotify.jsx";
 import OtaConfigPage from "./pages/OtaConfig.jsx";
 
-const { Sider, Content, Header } = Layout;
+const { Sider, Content, Header, Footer } = Layout;
 
 const items = [
   { key: "video-upload", icon: <VideoCameraOutlined />, label: "视频上传" },
@@ -81,6 +81,34 @@ export default function App() {
             {active === "ota-notify" && <OtaNotifyPage />}
           </div>
         </Content>
+        <Footer
+          style={{
+            textAlign: "center",
+            background: "#fff",
+            padding: "12px 50px",
+            borderTop: "1px solid #f0f0f0",
+          }}
+        >
+          <a
+            href={import.meta.env.VITE_FOOTER_OFFICIAL_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {import.meta.env.VITE_FOOTER_OFFICIAL_LABEL}
+          </a>
+          {import.meta.env.VITE_FOOTER_ICP && (
+            <>
+              {"  ·  "}
+              <a
+                href={import.meta.env.VITE_FOOTER_ICP_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {import.meta.env.VITE_FOOTER_ICP}
+              </a>
+            </>
+          )}
+        </Footer>
       </Layout>
     </Layout>
   );

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use axum::{
     Json,
-    extract::{Multipart, Path as AxumPath, State},
+    extract::{Multipart, Path as AxumPath, Query, State},
 };
 use futures_util::TryStreamExt;
 use md5::{Digest, Md5};
@@ -17,18 +17,64 @@ use crate::{
     service::{OtaError, Response},
 };
 
+/// 作为设备 config 模板的参考配置（来自项目根 device_cfg.json，编译期嵌入）。
+/// 前端「生成设备模板」按钮会拉取此内容作为起点。
+const DEVICE_CFG_TEMPLATE: &str = include_str!("../../device_cfg.json");
+
+#[derive(Deserialize)]
+pub struct NotifyQuery {
+    /// 可选 device_id：非空时下发的 MQTT 消息会带上 device_id，仅匹配设备应用。
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// 是否携带该设备专属 config（默认 true）。
+    /// false 时即使设备有专属 config 也忽略，退回到版本级（全局）config；
+    /// 全局 config 也不存在则不下发 config（仅版本号 + device_id）。
+    #[serde(default = "default_true")]
+    pub carry_device_config: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 pub async fn ota_update(
     AxumPath(version): AxumPath<String>,
     State(app_state): State<AppState>,
+    Query(q): Query<NotifyQuery>,
 ) -> Result<Response<()>, OtaError> {
-    let decision = resolve_broadcast(&app_state.db, &version).await;
-    if decision.skip {
-        return Err(OtaError::InvalidInput(format!(
-            "版本 {version} 文件夹不存在/为空 且 无 config，跳过广播"
-        )));
-    }
+    let device_id = q
+        .device_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    // 指定 device_id 时：
+    //   carry_device_config=true  → 设备专属 config（无则退回全局）
+    //   carry_device_config=false → 忽略设备专属，直接用全局（全局无则 None = 无配置改动）
+    // 未指定 device_id 时走版本级广播决策。
+    let config = if let Some(did) = device_id {
+        if q.carry_device_config {
+            let dev_cfg = get_device_config_raw(&app_state.db, &version, did).await;
+            if dev_cfg.is_some() {
+                dev_cfg
+            } else {
+                get_version_config_raw(&app_state.db, &version).await
+            }
+        } else {
+            get_version_config_raw(&app_state.db, &version).await
+        }
+    } else {
+        let decision = resolve_broadcast(&app_state.db, &version).await;
+        if decision.skip {
+            return Err(OtaError::InvalidInput(format!(
+                "版本 {version} 文件夹不存在/为空 且 无 config，跳过广播"
+            )));
+        }
+        decision.config
+    };
+
     app_state
-        .send_fleet_update(&version, decision.config.as_ref())
+        .send_fleet_update(&version, config.as_ref(), device_id)
         .await?;
     Ok(Response::success(()))
 }
@@ -97,13 +143,28 @@ async fn sorted_versions() -> Vec<String> {
     versions
 }
 
-pub async fn latest_published_version() -> Option<String> {
-    sorted_versions().await.into_iter().next()
-}
-
 #[derive(Deserialize)]
 pub struct ConfigReq {
     config: serde_json::Value,
+}
+
+/// 附加配置的必填校验：config 必须是 JSON 对象，且根级含非空字符串的 `version` 字段。
+/// 无论全局还是设备专属，缺 version 一律拒绝。
+fn require_config_version(config: &serde_json::Value) -> Result<(), OtaError> {
+    let obj = config
+        .as_object()
+        .ok_or_else(|| OtaError::InvalidInput("config 必须是 JSON 对象".to_string()))?;
+    let ok = obj
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !ok {
+        return Err(OtaError::InvalidInput(
+            "config 必填字段 version 缺失或为空（根级非空字符串）".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 取某版本的 config（供 interval/notify 下发）。无则 None。
@@ -117,14 +178,13 @@ pub async fn get_version_config_raw(
         .await
         .ok()?;
     row.and_then(|(s,)| serde_json::from_str(&s).ok())
-}
-
-/// POST /ota/{version}/config  body: {"config": {...}}
+}/// POST /ota/{version}/config  body: {"config": {...}}
 pub async fn set_version_config(
     State(app_state): State<AppState>,
     AxumPath(version): AxumPath<String>,
     Json(req): Json<ConfigReq>,
 ) -> Result<Response<()>, OtaError> {
+    require_config_version(&req.config)?;
     let config_json = serde_json::to_string(&req.config)
         .map_err(|e| OtaError::InvalidInput(format!("序列化 config 失败: {e}")))?;
     sqlx::query("INSERT OR REPLACE INTO version_config (version, config) VALUES (?, ?)")
@@ -232,4 +292,122 @@ pub async fn ota_publish(
     }
 
     Ok(Response::success(()))
+}
+
+// ───────────────────────── 设备专属 config ─────────────────────────
+//
+// 版本级 config（version_config 表）：对整个 fleet 生效，每 10 分钟自动广播。
+// 设备级 config（device_version_config 表）：仅对单个 device_id 生效，
+// 需手动「发布」时携带 device_id，下发的 MQTT 消息会带 device_id 字段，
+// 设备端收到后比对自身 ID，匹配才应用（覆盖版本级 config）。
+
+/// 取某版本下某设备的 config。无则 None。
+pub async fn get_device_config_raw(
+    pool: &sqlx::SqlitePool,
+    version: &str,
+    device_id: &str,
+) -> Option<serde_json::Value> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT config FROM device_version_config WHERE version = ? AND device_id = ?")
+            .bind(version)
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await
+            .ok()?;
+    row.and_then(|(s,)| serde_json::from_str(&s).ok())
+}
+
+/// GET /ota/{version}/devices  → 列出该版本下已配置过的 device_id
+pub async fn list_device_configs(
+    State(app_state): State<AppState>,
+    AxumPath(version): AxumPath<String>,
+) -> Result<Response<Vec<String>>, OtaError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT device_id FROM device_version_config WHERE version = ? ORDER BY device_id")
+            .bind(&version)
+            .fetch_all(&app_state.db)
+            .await?;
+    Ok(Response::success(rows.into_iter().map(|(d,)| d).collect()))
+}
+
+/// GET /ota/{version}/config/{device_id}
+pub async fn get_device_config(
+    State(app_state): State<AppState>,
+    AxumPath((version, device_id)): AxumPath<(String, String)>,
+) -> Result<Response<serde_json::Value>, OtaError> {
+    match get_device_config_raw(&app_state.db, &version, &device_id).await {
+        Some(v) => Ok(Response::success(v)),
+        None => Err(OtaError::FileNotFound(format!(
+            "版本 {version} 下设备 {device_id} 无专属配置"
+        ))),
+    }
+}
+
+/// POST /ota/{version}/config/{device_id}  body: {"config": {...}}
+pub async fn set_device_config(
+    State(app_state): State<AppState>,
+    AxumPath((version, device_id)): AxumPath<(String, String)>,
+    Json(req): Json<ConfigReq>,
+) -> Result<Response<()>, OtaError> {
+    save_device_config(&app_state.db, &version, &device_id, &req.config).await?;
+    Ok(Response::success(()))
+}
+
+async fn save_device_config(
+    pool: &sqlx::SqlitePool,
+    version: &str,
+    device_id: &str,
+    config: &serde_json::Value,
+) -> Result<(), OtaError> {
+    require_config_version(config)?;
+    let config_json = serde_json::to_string(config)
+        .map_err(|e| OtaError::InvalidInput(format!("序列化 config 失败: {e}")))?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO device_version_config (version, device_id, config) VALUES (?, ?, ?)",
+    )
+    .bind(version)
+    .bind(device_id)
+    .bind(&config_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// DELETE /ota/{version}/config/{device_id}
+/// 删除 DB 记录，并清空该设备的专属 retained topic（`cmd_topic/{device_id}`），
+/// 避免残留旧专属消息长期留在 broker 上。
+pub async fn delete_device_config(
+    State(app_state): State<AppState>,
+    AxumPath((version, device_id)): AxumPath<(String, String)>,
+) -> Result<Response<()>, OtaError> {
+    sqlx::query("DELETE FROM device_version_config WHERE version = ? AND device_id = ?")
+        .bind(&version)
+        .bind(&device_id)
+        .execute(&app_state.db)
+        .await?;
+    // best-effort 清空 retained（失败不阻塞删除）
+    let topic = format!("{}/{device_id}", app_state.config.mqtt_conf.cmd_topic);
+    let _ = app_state.clear_retained(&topic).await;
+    Ok(Response::success(()))
+}
+
+/// POST /ota/{version}/publish_device/{device_id}
+/// 保存该设备的 config 并立即广播（payload 带 device_id，仅匹配设备应用）。
+pub async fn publish_device_config(
+    State(app_state): State<AppState>,
+    AxumPath((version, device_id)): AxumPath<(String, String)>,
+    Json(req): Json<ConfigReq>,
+) -> Result<Response<()>, OtaError> {
+    save_device_config(&app_state.db, &version, &device_id, &req.config).await?;
+    app_state
+        .send_fleet_update(&version, Some(&req.config), Some(&device_id))
+        .await?;
+    Ok(Response::success(()))
+}
+
+/// GET /ota/template  → 返回 device_cfg.json 模板（前端「生成设备模板」用）
+pub async fn get_config_template() -> Result<Response<serde_json::Value>, OtaError> {
+    let v: serde_json::Value = serde_json::from_str(DEVICE_CFG_TEMPLATE)
+        .map_err(|e| OtaError::InvalidInput(format!("模板解析失败: {e}")))?;
+    Ok(Response::success(v))
 }

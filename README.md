@@ -21,19 +21,45 @@
 
 ### 2.1 OTA 升级通知（必订）
 
-- **Topic**: `k230/cam/cmd`
-- **Payload** (JSON, UTF-8):
+> 服务端不再定时广播。所有下发消息均为 **retained**：设备每次（重新）订阅即收到
+> 该 topic 上最后一条消息。
+
+需要订阅 **两个** topic（都是 retained，互不覆盖）：
+
+| Topic | 作用 | 谁会收到 |
+|---|---|---|
+| `k230/cam/cmd` | 全局（fleet） | 所有设备 |
+| `k230/cam/cmd/{device_id}` | 本机专属配置/定向升级 | 仅该 device_id 的设备 |
+
+把 `{device_id}` 替换成自己的 ID，例如 `k230/cam/cmd/k230-a1b2`。
+
+**Payload**（JSON, UTF-8）：
 
 ```json
-{"ts": 1720000000000, "version": "1.0.1"}
+{
+  "cmd": "fleet_update",
+  "version": "1.0.1",
+  "config": { "app_params": { "sleep_interval": 60 } },
+  "device_id": "k230-a1b2"
+}
 ```
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `ts` | u64 | 服务端时间戳（毫秒） |
-| `version` | string | 最新可用版本号 |
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---|---|
+| `cmd` | string | 是 | 固定 `"fleet_update"` |
+| `version` | string | 是 | 目标版本号 |
+| `config` | object | 否 | 随版本下发的配置，deep_merge 进 `device_cfg.json` |
+| `device_id` | string | 否 | 仅出现在**定向**消息中；全局消息无此字段 |
 
-**收到后的动作**：与本机当前版本比较；若服务端版本更新，触发 §3 的 OTA 流程。
+**收到后的动作（优先专属、回退全局，无需自己 merge 两条）**：
+
+1. 若 payload 带 `device_id` 且 == 本机 ID（或来自 `cmd/{本机ID}` topic）→ 以这条**专属消息**为准。
+2. 若 payload 不带 `device_id`（来自 `cmd` 全局 topic）→ 仅当本机**没有**收到过专属消息时使用。
+3. 带 `device_id` 但 != 本机 → 忽略（防御性，per-device topic 隔离下一般不会发生）。
+4. 选定消息后：与本机当前版本比较，更新则触发 §3 的 OTA 流程；有 `config` 则 merge 写入本地配置。
+
+> 因为全局与专属是不同 topic 的 retained，互不覆盖。专属消息会持久保留到被新专属
+> 消息替换，或服务端删除该设备配置时（发空 retained 清空 topic）。
 
 ### 2.2 视频上传事件（按需订）
 
