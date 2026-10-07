@@ -26,3 +26,116 @@ body,
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ── 设备活动状态灯 ── */
+/* flex 铺满整列宽度:chip/Badge 才有完整的右缘滑入与滚动空间 */
+.act-cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding-right: 2px;
+}
+
+.act-time {
+  flex: none;
+}
+
+.act-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+
+/* 事件到达时状态灯脉冲 3 次 */
+.act-dot.flash {
+  animation: dotPulse 0.9s ease-in-out 3;
+}
+
+@keyframes dotPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(2);
+    opacity: 0.45;
+  }
+}
+
+/* 事件条:antd 状态点 Badge 从单元格右缘划入,宽度可占满整格 */
+.act-event-wrap {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 100%;
+  animation: chipSlideIn 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Badge 状态条定制:占满可用宽度、文字小一号 */
+.act-event-wrap .ant-badge-status {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.act-event-wrap .ant-badge-status-text {
+  font-size: 12px;
+  margin-left: 6px;
+  min-width: 0;
+  max-width: 100%;
+  display: inline-flex;
+  /* baseline 对齐:12px 标签与 10px 详情共用一条文字基线 */
+  align-items: baseline;
+  gap: 4px;
+}
+
+.act-event-label {
+  flex: none;
+}
+
+.act-chip-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  display: inline-block;
+  white-space: nowrap;
+  color: rgba(0, 0, 0, 0.45);
+  font-size: 10px;
+}
+
+/* 详情溢出时来回滚动（ping-pong），溢出量/时长由 JS 实测注入 CSS 变量 */
+.act-chip-detail .marquee-inner {
+  display: inline-block;
+  white-space: nowrap;
+  animation: marqueePingPong var(--marquee-dur, 4s) ease-in-out infinite
+    alternate;
+}
+
+@keyframes marqueePingPong {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(var(--marquee-shift, 0px));
+  }
+}
+
+@keyframes chipSlideIn {
+  from {
+    transform: translateY(-50%) translateX(110%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(-50%) translateX(0);
+    opacity: 1;
+  }
+}

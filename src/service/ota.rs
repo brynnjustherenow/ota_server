@@ -85,10 +85,8 @@ pub async fn version_folder_has_files(version: &str) -> bool {
     let Ok(mut entries) = fs::read_dir(&dir).await else {
         return false;
     };
-    while let Ok(Some(_)) = entries.next_entry().await {
-        return true;
-    }
-    false
+    // 任一条目存在即视为非空
+    matches!(entries.next_entry().await, Ok(Some(_)))
 }
 
 /// 广播决策：版本文件夹不存在/为空 且 无 config → skip=true（跳过，保留上一条 retained）。
@@ -102,9 +100,15 @@ pub async fn resolve_broadcast(pool: &sqlx::SqlitePool, version: &str) -> Broadc
     let config = get_version_config_raw(pool, version).await;
     let has_files = version_folder_has_files(version).await;
     if !has_files && config.is_none() {
-        return BroadcastDecision { skip: true, config: None };
+        return BroadcastDecision {
+            skip: true,
+            config: None,
+        };
     }
-    BroadcastDecision { skip: false, config }
+    BroadcastDecision {
+        skip: false,
+        config,
+    }
 }
 
 /// GET /ota
@@ -172,13 +176,15 @@ pub async fn get_version_config_raw(
     pool: &sqlx::SqlitePool,
     version: &str,
 ) -> Option<serde_json::Value> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT config FROM version_config WHERE version = ?")
-        .bind(version)
-        .fetch_optional(pool)
-        .await
-        .ok()?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT config FROM version_config WHERE version = ?")
+            .bind(version)
+            .fetch_optional(pool)
+            .await
+            .ok()?;
     row.and_then(|(s,)| serde_json::from_str(&s).ok())
-}/// POST /ota/{version}/config  body: {"config": {...}}
+}
+/// POST /ota/{version}/config  body: {"config": {...}}
 pub async fn set_version_config(
     State(app_state): State<AppState>,
     AxumPath(version): AxumPath<String>,
@@ -307,13 +313,14 @@ pub async fn get_device_config_raw(
     version: &str,
     device_id: &str,
 ) -> Option<serde_json::Value> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT config FROM device_version_config WHERE version = ? AND device_id = ?")
-            .bind(version)
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await
-            .ok()?;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT config FROM device_version_config WHERE version = ? AND device_id = ?",
+    )
+    .bind(version)
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
     row.and_then(|(s,)| serde_json::from_str(&s).ok())
 }
 
@@ -322,11 +329,12 @@ pub async fn list_device_configs(
     State(app_state): State<AppState>,
     AxumPath(version): AxumPath<String>,
 ) -> Result<Response<Vec<String>>, OtaError> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT device_id FROM device_version_config WHERE version = ? ORDER BY device_id")
-            .bind(&version)
-            .fetch_all(&app_state.db)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT device_id FROM device_version_config WHERE version = ? ORDER BY device_id",
+    )
+    .bind(&version)
+    .fetch_all(&app_state.db)
+    .await?;
     Ok(Response::success(rows.into_iter().map(|(d,)| d).collect()))
 }
 

@@ -34,7 +34,9 @@ impl AppState {
     pub async fn publish_retained(&self, topic: &str, msg: Vec<u8>) -> Result<(), OtaError> {
         let mut opts = PublishOptions::default();
         opts.retain = true;
-        self.ota_client.publish_with_options(topic, msg, opts).await?;
+        self.ota_client
+            .publish_with_options(topic, msg, opts)
+            .await?;
         Ok(())
     }
 

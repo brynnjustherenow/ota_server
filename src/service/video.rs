@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{
-    Form, Json,
+    Extension, Form, Json,
     body::Body,
     extract::{Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
@@ -24,7 +24,11 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     AppState,
-    service::{OtaError, Response},
+    service::{
+        OtaError, Response,
+        auth::{CurrentUser, ROLE_GROUP_USER},
+        device, ws,
+    },
 };
 
 #[derive(Serialize)]
@@ -42,11 +46,8 @@ pub struct VideoMeta {
     modified_at: u64,
 }
 
-fn is_safe_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains("..")
+pub fn is_safe_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
 }
 
 /// POST /video/{device_id}
@@ -60,7 +61,9 @@ pub async fn upload_video(
     body: Body,
 ) -> Result<Response<VideoInfo>, OtaError> {
     if !is_safe_name(&device_id) {
-        return Err(OtaError::InvalidInput(format!("非法 device_id: {device_id}")));
+        return Err(OtaError::InvalidInput(format!(
+            "非法 device_id: {device_id}"
+        )));
     }
 
     let filename = parse_filename(&headers)
@@ -81,7 +84,8 @@ pub async fn upload_video(
                 StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
             // 套 BufWriter：read buffer 虽是 16KB，但 tokio::fs::File 无用户态缓冲，
             // 每次 write_all 都是 syscall。用 2MB 缓冲合并小写。
-            let mut file = BufWriter::with_capacity(2 * 1024 * 1024, fs::File::create(&staging).await?);
+            let mut file =
+                BufWriter::with_capacity(2 * 1024 * 1024, fs::File::create(&staging).await?);
             let mut hasher = Md5::new();
             let mut total: u64 = 0;
             let mut buf = vec![0u8; 16 * 1024];
@@ -119,6 +123,19 @@ pub async fn upload_video(
     if let Err(e) = app_state.send_video_event(&device_id, &filename).await {
         tracing::warn!(error = %e, %device_id, %filename, "publish video_uploaded event failed");
     }
+    // 更新设备活动时间（尽力而为，失败仅告警）+ WebSocket 广播
+    device::touch_device_activity(&app_state.db, &device_id).await;
+    ws::broadcast_activity(
+        &app_state.activity_tx,
+        ws::ActivityMsg {
+            device_id: device_id.clone(),
+            source: "video".into(),
+            kind: "video".into(),
+            event: None,
+            detail: Some(filename.clone()),
+            ts: chrono::Utc::now().timestamp(),
+        },
+    );
 
     Ok(Response::success(VideoInfo {
         device_id,
@@ -129,8 +146,12 @@ pub async fn upload_video(
 }
 
 /// GET /video
-/// 列出所有上传过视频的 device_id（video/ 下的子目录）
-pub async fn list_devices() -> Result<Response<Vec<String>>, OtaError> {
+/// 列出所有上传过视频的 device_id（video/ 下的子目录）。
+/// 组用户只能看到名下设备的目录。
+pub async fn list_devices(
+    State(app_state): State<AppState>,
+    Extension(current): Extension<CurrentUser>,
+) -> Result<Response<Vec<String>>, OtaError> {
     let root = Path::new("video");
     if !fs::try_exists(root).await? {
         return Ok(Response::success(vec![]));
@@ -145,17 +166,31 @@ pub async fn list_devices() -> Result<Response<Vec<String>>, OtaError> {
             }
         }
     }
+    if current.role == ROLE_GROUP_USER {
+        let owned = device::owned_device_ids(&app_state.db, current.id).await?;
+        devices.retain(|d| owned.contains(d));
+    }
     devices.sort();
     Ok(Response::success(devices))
 }
 
 /// GET /video/{device_id}
-/// 列出该设备的所有视频，按修改时间倒序（最新在前）；目录不存在返回空数组
+/// 列出该设备的所有视频，按修改时间倒序（最新在前）；目录不存在返回空数组。
+/// 组用户仅可查看名下设备。
 pub async fn list_videos(
+    State(app_state): State<AppState>,
+    Extension(current): Extension<CurrentUser>,
     AxumPath(device_id): AxumPath<String>,
 ) -> Result<Response<Vec<VideoMeta>>, OtaError> {
     if !is_safe_name(&device_id) {
-        return Err(OtaError::InvalidInput(format!("非法 device_id: {device_id}")));
+        return Err(OtaError::InvalidInput(format!(
+            "非法 device_id: {device_id}"
+        )));
+    }
+    if current.role == ROLE_GROUP_USER
+        && !device::is_device_owned_by(&app_state.db, &device_id, current.id).await?
+    {
+        return Err(OtaError::Forbidden("无权访问该设备的视频".into()));
     }
 
     let dir = Path::new("video").join(&device_id);
@@ -176,10 +211,7 @@ pub async fn list_videos(
         if !meta.is_file() {
             continue;
         }
-        let modified_at = meta
-            .modified()
-            .map(system_time_to_ms)
-            .unwrap_or(0);
+        let modified_at = meta.modified().map(system_time_to_ms).unwrap_or(0);
         items.push(VideoMeta {
             filename: name,
             size: meta.len(),
@@ -192,22 +224,30 @@ pub async fn list_videos(
 }
 
 /// GET /video/{device_id}/{filename}
-/// 流式下载指定视频，支持 HTTP Range（用于 `<video>` 拖动进度条）
+/// 流式下载指定视频，支持 HTTP Range（用于 `<video>` 拖动进度条）。
+/// 组用户仅可下载名下设备视频。
 pub async fn download_video(
+    State(app_state): State<AppState>,
+    Extension(current): Extension<CurrentUser>,
     AxumPath((device_id, filename)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<AxumResponse, OtaError> {
     if !is_safe_name(&device_id) {
-        return Err(OtaError::InvalidInput(format!("非法 device_id: {device_id}")));
+        return Err(OtaError::InvalidInput(format!(
+            "非法 device_id: {device_id}"
+        )));
     }
     if !is_safe_name(&filename) {
         return Err(OtaError::InvalidInput(format!("非法 filename: {filename}")));
     }
+    if current.role == ROLE_GROUP_USER
+        && !device::is_device_owned_by(&app_state.db, &device_id, current.id).await?
+    {
+        return Err(OtaError::Forbidden("无权访问该设备的视频".into()));
+    }
 
     let path = Path::new("video").join(&device_id).join(&filename);
-    let range = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok());
+    let range = headers.get("range").and_then(|v| v.to_str().ok());
     let content_type = crate::service::util::guess_video_mime(&filename);
     crate::service::util::serve_file(
         &path,
@@ -401,11 +441,7 @@ pub async fn upload_init(
     }
 
     // 续传：客户端带上已存在的 upload_id
-    if let Some(uid) = req
-        .upload_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(uid) = req.upload_id.as_deref().filter(|s| !s.is_empty()) {
         if let Some(sess) = uploads.get(uid) {
             return Ok(Json(VideoResp::success(InitData {
                 upload_id: uid.to_string(),
@@ -454,6 +490,37 @@ pub async fn upload_init(
 
 // ---------- chunk ----------
 
+/// 打开 .partial 临时文件并截断定位到已确认 offset。
+///
+/// 截断用于清除上次 chunk 半写残留：若上一片 write_all 后、回写 received 前连接
+/// 断开（设备重启），文件会含半截数据而 received 未更新。设备重试同一 offset 时
+/// 若不截断就续写，会写入重复字节，导致最终文件 > file_size、MP4 损坏。
+///
+/// 平台差异：生产环境（Linux）用 append 句柄——set_len 截断后每次写原子落在
+/// 文件末尾；Windows 上对 append 句柄调用 set_len 会报 os error 5（拒绝访问），
+/// 故 Windows 单独走 write-only + 截断 + seek 的等价实现（单会话单写入方，
+/// 分片串行，seek 定位与 append 尾写行为一致）。
+async fn open_partial_at(temp_path: &Path, x_offset: u64) -> Result<fs::File, std::io::Error> {
+    #[cfg(not(windows))]
+    {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(temp_path)
+            .await?;
+        file.set_len(x_offset).await?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use tokio::io::AsyncSeekExt as _;
+        let mut file = fs::OpenOptions::new().write(true).open(temp_path).await?;
+        file.set_len(x_offset).await?;
+        file.seek(std::io::SeekFrom::Start(x_offset)).await?;
+        Ok(file)
+    }
+}
+
 /// PUT /{base}/{biz}/chunk
 /// multipart/form-data，字段名 chunk。Header: X-Offset, X-Upload-Id [, X-part-number]
 /// 响应 data: 裸整数 offset（与原 Java 服务端行为一致）
@@ -492,16 +559,7 @@ pub async fn upload_chunk(
     // ② 无锁：从 multipart 里读 chunk field 写文件
     let mut received = x_offset;
     {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(&temp_path)
-            .await?;
-        // 截断到已确认 offset，清除上次 chunk 半写残留：
-        // 若上一片 write_all 后、回写 received 前连接断开（设备重启），文件会含半截
-        // 数据而 received 未更新。设备重试同一 offset 时若不截断就 append，会写入
-        // 重复字节，导致最终文件 > file_size、MP4 损坏。set_len 后 append 从新末尾写。
-        file.set_len(x_offset).await?;
+        let file = open_partial_at(&temp_path, x_offset).await?;
         // 套一层 BufWriter：field.chunk() 每次只有 8-16KB，
         // 直写 tokio::fs::File 每次都是 syscall。512KB 分片下会有 32-64 次小写，
         // 用 1MB 缓冲（≈2 个分片）合并成 1-2 次大写，显著降低 I/O 放大。
@@ -525,9 +583,7 @@ pub async fn upload_chunk(
                     tokio::time::timeout(Duration::from_secs(60), field.chunk()).await;
                 let chunk_opt = match chunk_result {
                     Err(_) => return Err(VideoError::Bad("读取分片超时(60s)".to_string())),
-                    Ok(Err(e)) => {
-                        return Err(VideoError::Bad(format!("chunk field 错误: {e}")))
-                    }
+                    Ok(Err(e)) => return Err(VideoError::Bad(format!("chunk field 错误: {e}"))),
                     Ok(Ok(opt)) => opt,
                 };
                 let chunk_bytes = match chunk_opt {
@@ -626,6 +682,19 @@ async fn complete_impl(
                     "publish video_uploaded event failed"
                 );
             }
+            // 更新设备活动时间（尽力而为，失败仅告警）+ WebSocket 广播
+            device::touch_device_activity(&app_state.db, &sess.device_id).await;
+            ws::broadcast_activity(
+                &app_state.activity_tx,
+                ws::ActivityMsg {
+                    device_id: sess.device_id.clone(),
+                    source: "video".into(),
+                    kind: "video".into(),
+                    event: None,
+                    detail: Some(sess.filename.clone()),
+                    ts: chrono::Utc::now().timestamp(),
+                },
+            );
             Ok(Json(VideoResp::success(CompleteData {
                 ok: true,
                 file_url,
@@ -692,7 +761,12 @@ pub async fn cleanup_orphan_partials() {
         Err(_) => return,
     };
     while let Ok(Some(dev_dir)) = entries.next_entry().await {
-        if !dev_dir.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        if !dev_dir
+            .file_type()
+            .await
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         let mut sub = match fs::read_dir(dev_dir.path()).await {

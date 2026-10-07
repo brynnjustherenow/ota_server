@@ -1,10 +1,6 @@
 use std::path::Path;
 
-use axum::{
-    body::Body,
-    http::StatusCode,
-    response::Response as AxumResponse,
-};
+use axum::{body::Body, http::StatusCode, response::Response as AxumResponse};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
@@ -116,7 +112,10 @@ pub async fn serve_file(
         let body = Body::from_stream(ReaderStream::new(file.take(len)));
         return Ok(builder
             .status(StatusCode::PARTIAL_CONTENT)
-            .header("content-range", format!("bytes {}-{}/{}", r.start, r.end, r.total))
+            .header(
+                "content-range",
+                format!("bytes {}-{}/{}", r.start, r.end, r.total),
+            )
             .header("content-length", len.to_string())
             .body(body)
             .expect("build 206 response"));

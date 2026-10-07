@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
     http::{HeaderValue, Method, StatusCode, header, uri::Port},
+    middleware,
     routing::{get, post, put},
 };
 mod hardware;
@@ -21,14 +22,23 @@ pub struct AppState {
     db: sqlx::SqlitePool,
     config: Config,
     uploads: Arc<Mutex<HashMap<String, service::video::UploadSession>>>,
+    /// 设备活动事件广播（WebSocket 实时推送）
+    activity_tx: tokio::sync::broadcast::Sender<service::ws::ActivityMsg>,
 }
 impl AppState {
-    fn new(client: MqttClient, db: sqlx::SqlitePool, config: Config) -> Self {
+    #[allow(dead_code)]
+    fn new(
+        client: MqttClient,
+        db: sqlx::SqlitePool,
+        config: Config,
+        activity_tx: tokio::sync::broadcast::Sender<service::ws::ActivityMsg>,
+    ) -> Self {
         Self {
             ota_client: client,
             db,
-            config: config,
+            config,
             uploads: Arc::new(Mutex::new(HashMap::new())),
+            activity_tx,
         }
     }
 }
@@ -41,10 +51,32 @@ struct Config {
     mqtt_conf: MqttConfig,
     #[serde(default)]
     bark: BarkConfig,
+    #[serde(default)]
+    auth: AuthConfig,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct BarkConfig {
     key: String,
+}
+/// 鉴权配置：jwt_secret 为空时启动阶段自动生成并回写配置文件，
+/// 保证重启后已签发的 token 依然有效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthConfig {
+    #[serde(default)]
+    jwt_secret: String,
+    #[serde(default = "default_token_expire_days")]
+    token_expire_days: u64,
+}
+fn default_token_expire_days() -> u64 {
+    7
+}
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            jwt_secret: String::new(),
+            token_expire_days: default_token_expire_days(),
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MqttConfig {
@@ -60,6 +92,7 @@ impl Default for Config {
             mqtt_client_id: default_mqtt_client_id(),
             mqtt_conf: MqttConfig::default(),
             bark: BarkConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -128,22 +161,81 @@ async fn main() {
     .execute(&db)
     .await
     .expect("device_events migrate");
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_device ON device_events(device_id, id)")
+        .execute(&db)
+        .await
+        .expect("device_events index");
+    // 用户表：三种角色 super_admin(主管理员)/admin(管理员)/group_user(组用户)。
+    // token_version 用于改密/禁用/改角色后让旧 JWT 立即失效。
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_events_device ON device_events(device_id, id)",
+        "CREATE TABLE IF NOT EXISTS users (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         username TEXT NOT NULL UNIQUE,\
+         password_hash TEXT NOT NULL,\
+         nickname TEXT NOT NULL DEFAULT '',\
+         role TEXT NOT NULL CHECK(role IN ('super_admin','admin','group_user')),\
+         enabled INTEGER NOT NULL DEFAULT 1,\
+         token_version INTEGER NOT NULL DEFAULT 0,\
+         created_at TEXT NOT NULL,\
+         updated_at TEXT NOT NULL)",
     )
     .execute(&db)
     .await
-    .expect("device_events index");
+    .expect("users migrate");
+    service::auth::init_admin(&db).await;
+    // 设备表：展示名（仅前端展示，不同步硬件）、归属组用户、上次活动时间（unix 秒）。
+    // 行记录按需惰性创建（首次活动/改名/分配归属），老设备不回填；
+    // GET /devices 读时三来源 UNION 合并，活动时间兜底取 device_events 最新事件。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS devices (\
+         device_id TEXT PRIMARY KEY,\
+         name TEXT NOT NULL DEFAULT '',\
+         owner_user_id INTEGER,\
+         last_active_at INTEGER,\
+         created_at TEXT NOT NULL,\
+         updated_at TEXT NOT NULL)",
+    )
+    .execute(&db)
+    .await
+    .expect("devices migrate");
+    // 环境数据表：MQTT env 消息持久化（payload 原始 JSON，ts unix 秒便于区间查询）
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS device_env (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         device_id TEXT NOT NULL,\
+         ts INTEGER NOT NULL,\
+         payload TEXT NOT NULL,\
+         received_at TEXT NOT NULL)",
+    )
+    .execute(&db)
+    .await
+    .expect("device_env migrate");
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_env_device_ts ON device_env(device_id, ts DESC)",
+    )
+    .execute(&db)
+    .await
+    .expect("device_env index");
 
-    let client = init_mqtt_client(&conf.mqtt_conf, &conf.mqtt_client_id, db.clone(), bark_key)
-        .await
-        .expect("create mqtt client failed");
+    // WebSocket 活动广播通道（先于 MQTT 初始化：status 回调需要发送端）
+    let activity_tx = service::ws::new_hub();
+
+    let client = init_mqtt_client(
+        &conf.mqtt_conf,
+        &conf.mqtt_client_id,
+        db.clone(),
+        bark_key,
+        activity_tx.clone(),
+    )
+    .await
+    .expect("create mqtt client failed");
 
     let app_state = AppState {
         ota_client: client,
         db,
         config: conf,
         uploads: Arc::new(Mutex::new(HashMap::new())),
+        activity_tx,
     };
     // 不再定时广播：retained 消息会保留在 broker，设备订阅即收到最后一条。
     // 全局在 cmd_topic，设备专属在 cmd_topic/{device_id}，互不覆盖。
@@ -225,7 +317,38 @@ async fn main() {
         // 路由按前缀组织，避免重复定义。
         .nest("/Mtpi", make_upload_routes())
         .nest("/Mpi", make_upload_routes())
-        .with_state(app_state)
+        // 用户系统：登录 / 个人信息 / 改密 / 改昵称
+        .route("/auth/login", post(service::auth::login))
+        .route("/auth/me", get(service::auth::me))
+        .route("/auth/password", put(service::auth::change_password))
+        .route("/auth/profile", put(service::auth::update_profile))
+        // 用户管理（admin+，handler 内再做角色细分）
+        .route(
+            "/users",
+            get(service::user::list_users).post(service::user::create_user),
+        )
+        .route(
+            "/users/{id}",
+            put(service::user::update_user).delete(service::user::delete_user),
+        )
+        .route("/users/{id}/password", put(service::user::reset_password))
+        // WebSocket：设备活动实时推送（token 走 query，handler 内自校验）
+        .route("/ws", get(service::ws::ws_handler))
+        // 环境数据：设备/日期区间查询（组用户自动限定名下）
+        .route("/env", get(service::env::list_env))
+        // 设备管理：列表（组用户自动过滤名下）/ 改名 / 分配归属
+        .route("/devices", get(service::device::list_devices))
+        .route("/devices/{device_id}", put(service::device::update_device))
+        .route(
+            "/devices/{device_id}/owner",
+            put(service::device::update_owner),
+        )
+        .with_state(app_state.clone())
+        // 全局鉴权：auth_guard 内部按 method+path 白名单放行设备端匿名接口
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            service::auth::auth_guard,
+        ))
         .layer(cors);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
@@ -263,14 +386,17 @@ fn make_upload_routes() -> Router<AppState> {
 async fn health() -> StatusCode {
     StatusCode::OK
 }
-/// init the mqtt client and subscribe the topics
+/// init the mqtt client and subscribe the topic
+/// if has bark_key : the client will handle mqtt message with  and push a massage to the bark
+///
 async fn init_mqtt_client(
     config: &MqttConfig,
     client_id: &str,
     db: sqlx::SqlitePool,
     bark_key: String,
+    activity_tx: tokio::sync::broadcast::Sender<service::ws::ActivityMsg>,
 ) -> Result<MqttClient, String> {
-    let client = mqtt5::MqttClient::new(client_id);
+    let client = MqttClient::new(client_id);
     let opts = ConnectOptions::new(client_id.to_string());
     let host = &config.server_host;
     let port = config.server_post;
@@ -289,9 +415,15 @@ async fn init_mqtt_client(
             let payload = String::from_utf8_lossy(&message.payload).to_string();
             let db = db_status.clone();
             let bark_key = bark_key_status.clone();
+            let activity_tx = activity_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    hardware::event::handle_status_message(&db, &bark_key, &payload).await
+                if let Err(e) = hardware::event::handle_status_message(
+                    &db,
+                    &bark_key,
+                    &payload,
+                    &activity_tx,
+                )
+                .await
                 {
                     warn!("[EVENT] handle failed: {e}");
                 }
@@ -327,34 +459,37 @@ async fn init_mqtt_server() -> Result<(), String> {
     Ok(())
 }
 async fn init_config() -> Config {
-    let conf_default = Config::default();
     let path = ".conf.toml";
     let exist = fs::exists(&path).unwrap();
-    if !exist {
+    let conf_default = Config::default();
+    let mut conf = if !exist {
         let str = toml::to_string(&conf_default)
             .expect("failed to serialize config, this won't be happen...");
         info!("config not exist,create it..");
-        fs::write(&path, str);
+        let _ = fs::write(&path, str);
         info!("create done..");
-        return conf_default;
-    }
-    let result = fs::read_to_string(&path);
-    let Ok(str) = result else {
-        let str = toml::to_string(&conf_default)
-            .expect("failed to serialize config, this won't be happen...");
-        info!("config cannot read,overwrite it..");
-        fs::write(&path, str);
-        info!("overwrite done..");
-        return conf_default;
+        conf_default
+    } else {
+        let result = fs::read_to_string(&path);
+        match result {
+            Ok(str) if !str.is_empty() => toml::from_str(&str).unwrap_or(conf_default),
+            _ => {
+                let str = toml::to_string(&conf_default)
+                    .expect("failed to serialize config, this won't be happen...");
+                info!("config cannot read or empty,overwrite it..");
+                let _ = fs::write(&path, str);
+                conf_default
+            }
+        }
     };
-    if str.is_empty() {
-        let str = toml::to_string(&conf_default)
-            .expect("failed to serialize config, this won't be happen...");
-        info!("config is empty,write it..");
-        fs::write(&path, str);
-        info!("write done..");
-        return conf_default;
+    // [auth] 兼容：旧配置文件无 jwt_secret 时生成随机值并回写，
+    // 固定持久化，避免每次重启随机生成导致已签发 token 全部失效。
+    if conf.auth.jwt_secret.is_empty() {
+        conf.auth.jwt_secret = service::auth::generate_jwt_secret();
+        if let Ok(s) = toml::to_string(&conf) {
+            let _ = fs::write(&path, s);
+            info!("jwt_secret generated and persisted to {path}");
+        }
     }
-    let conf = toml::from_str(&str).unwrap_or(conf_default);
     conf
 }
